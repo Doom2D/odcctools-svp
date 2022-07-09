@@ -17,6 +17,9 @@ You should have received a copy of the GNU General Public License
 along with GAS; see the file COPYING.  If not, write to
 the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.  */
 
+/* FROM line 25 */
+#include "as.h"
+
 /*
  * Mach-O sections are chains of fragments.
  */
@@ -276,6 +279,36 @@ unsigned long n_sect)
 }
 
 unsigned long
+is_section_debug(
+unsigned long n_sect)
+{
+    struct frchain *frchainP;
+
+	for(frchainP = frchain_root; frchainP; frchainP = frchainP->frch_next){
+	    if(frchainP->frch_nsect == n_sect &&
+	       (frchainP->frch_section.flags & SECTION_ATTRIBUTES) ==
+	        S_ATTR_DEBUG)
+		return(1); /* TRUE */
+	}
+	return(0); /* FALSE */
+}
+
+unsigned long
+is_section_cstring_literals(
+unsigned long n_sect)
+{
+    struct frchain *frchainP;
+
+	for(frchainP = frchain_root; frchainP; frchainP = frchainP->frch_next){
+	    if(frchainP->frch_nsect == n_sect &&
+	       (frchainP->frch_section.flags & SECTION_TYPE) ==
+		S_CSTRING_LITERALS)
+		return(1); /* TRUE */
+	}
+	return(0); /* FALSE */
+}
+
+unsigned long
 is_end_section_address(
 unsigned long n_sect,
 unsigned long addr)
@@ -295,3 +328,28 @@ unsigned long addr)
 	return(0); /* FALSE */
 }
 
+unsigned long
+section_has_fixed_size_data(
+unsigned long n_sect)
+{
+    struct frchain *frchainP;
+
+	for(frchainP = frchain_root; frchainP; frchainP = frchainP->frch_next){
+	    if(frchainP->frch_nsect == n_sect){
+			switch (frchainP->frch_section.flags & SECTION_TYPE){
+				case S_CSTRING_LITERALS:
+				case S_4BYTE_LITERALS:
+				case S_8BYTE_LITERALS:
+				case S_16BYTE_LITERALS:
+				case S_LITERAL_POINTERS:
+				case S_NON_LAZY_SYMBOL_POINTERS:
+				case S_LAZY_SYMBOL_POINTERS:
+				case S_MOD_INIT_FUNC_POINTERS:
+				case S_MOD_TERM_FUNC_POINTERS:
+				case S_INTERPOSING:
+					return(1); /* TRUE */
+			}
+		}
+	}
+	return(0); /* FALSE */
+}

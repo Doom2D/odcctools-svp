@@ -31,6 +31,10 @@
 #include <mach-o/reloc.h>
 #include <mach-o/ranlib.h>
 
+#if __cplusplus
+extern "C" {
+#endif /* __cplusplus */
+
 extern void swap_fat_header(
     struct fat_header *fat_header,
     enum NXByteOrder target_byte_order);
@@ -44,6 +48,10 @@ extern void swap_mach_header(
     struct mach_header *mh,
     enum NXByteOrder target_byte_order);
 
+extern void swap_mach_header_64(
+    struct mach_header_64 *mh,
+    enum NXByteOrder target_byte_order);
+
 extern void swap_load_command(
     struct load_command *lc,
     enum NXByteOrder target_byte_order);
@@ -52,8 +60,17 @@ extern void swap_segment_command(
     struct segment_command *sg,
     enum NXByteOrder target_byte_order);
 
+extern void swap_segment_command_64(
+    struct segment_command_64 *sg,
+    enum NXByteOrder target_byte_order);
+
 extern void swap_section(
     struct section *s,
+    uint32_t nsects,
+    enum NXByteOrder target_byte_order);
+
+extern void swap_section_64(
+    struct section_64 *s,
     uint32_t nsects,
     enum NXByteOrder target_byte_order);
 
@@ -117,6 +134,10 @@ extern void swap_routines_command(
     struct routines_command *r_cmd,
     enum NXByteOrder target_byte_sex);
 
+extern void swap_routines_command_64(
+    struct routines_command_64 *r_cmd,
+    enum NXByteOrder target_byte_sex);
+
 extern void swap_twolevel_hints_command(
     struct twolevel_hints_command *hints_cmd,
     enum NXByteOrder target_byte_sex);
@@ -136,6 +157,11 @@ extern void swap_twolevel_hint(
 
 extern void swap_nlist(
     struct nlist *symbols,
+    uint32_t nsymbols,
+    enum NXByteOrder target_byte_order);
+
+extern void swap_nlist_64(
+    struct nlist_64 *symbols,
     uint32_t nsymbols,
     enum NXByteOrder target_byte_order);
 
@@ -164,9 +190,18 @@ extern void swap_dylib_module(
     uint32_t nmods, 
     enum NXByteOrder target_byte_sex);
 
+extern void swap_dylib_module_64(  
+    struct dylib_module_64 *mods,
+    uint32_t nmods, 
+    enum NXByteOrder target_byte_sex);
+
 extern void swap_dylib_table_of_contents(
     struct dylib_table_of_contents *tocs,
     uint32_t ntocs,
     enum NXByteOrder target_byte_sex);
+
+#if __cplusplus
+}
+#endif /* __cplusplus */
 
 #endif /* _MACH_O_SWAP_H_ */

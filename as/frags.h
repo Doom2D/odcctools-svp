@@ -19,8 +19,9 @@ You should have received a copy of the GNU General Public License
 along with GAS; see the file COPYING.  If not, write to
 the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.  */
 
-#include "relax.h"
-#include "struc-symbol.h"
+#import "as.h"
+#import "relax.h"
+#import "struc-symbol.h"
 
 /*
  * A code fragment (frag) is some known number of chars, followed by some
@@ -54,10 +55,18 @@ struct frag			/* a code fragment */
     relax_stateT fr_type;	/* What state is my tail in? */
     relax_substateT fr_subtype;	/* Used to index in to md_relax_table for */
 				/*  fr_type == rs_machine_dependent frags. */
+#ifdef ARM
+    /* Where the frag was created, or where it became a variant frag.  */
+    char *fr_file;
+    unsigned int fr_line;
+    /* Flipped each relax pass so we can easily determine whether
+       fr_address has been adjusted.  */
+    unsigned int relax_marker:1,
+		 pad:31;
+#endif /* ARM */
     char fr_literal[1];		/* Chars begin here. */
 				/* One day we will compile fr_literal[0]. */
 };
-typedef struct frag fragS;
 
 /* We want to say fr_literal[0] below */
 #define SIZEOF_STRUCT_FRAG \
@@ -70,6 +79,8 @@ typedef struct frag fragS;
  * frag_now->fr_fix + obstack_next_free(&frags) - frag_now->fr_literal.
  */
 extern fragS *frag_now;
+extern addressT frag_now_fix (void);
+extern addressT frag_now_fix_octets (void);
 
 /*
  * Frags ONLY live in this obstack.  We use obstack_next_free() macro 
@@ -80,6 +91,7 @@ extern struct obstack frags;
 /* For foreign-segment symbol fixups. */
 extern fragS zero_address_frag;
 
+extern void frag_grow (unsigned int nchars);
 extern void frag_new(
     int old_frags_var_max_size);
 extern char * frag_more(

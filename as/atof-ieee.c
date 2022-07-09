@@ -17,6 +17,9 @@ You should have received a copy of the GNU General Public License
 along with GAS; see the file COPYING.  If not, write to
 the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.  */
 
+/* FROM line 22 */
+#include "as.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -548,7 +551,7 @@ long x)
 	sprintf(buf,"%ld",x);
 	bufp= &buf[0];
 	if(atof_generic(&bufp,".", md_EXP_CHARS, &generic_floating_point_number))
-		as_warn("Error converting number to floating point (Exponent overflow?)");
+		as_fatal("Error converting number to floating point (Exponent overflow?)");
 }
 
 #ifdef TEST

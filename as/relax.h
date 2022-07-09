@@ -1,6 +1,3 @@
-#ifndef _RELAX_H_
-#define _RELAX_H_
-
 /* The type used for a target address */
 typedef unsigned long relax_addressT;
 
@@ -38,13 +35,10 @@ typedef unsigned long relax_substateT;
  * rlx_length, and which substate go to, rlx_more, if this sized branch can't 
  * reach it's target.
  */
-typedef struct {
+typedef struct relax_type {
     long	    rlx_forward;  /* Forward  reach. Signed number. > 0. */
     long	    rlx_backward; /* Backward reach. Signed number. < 0. */
     unsigned char   rlx_length;	  /* Bytes length of this address. */
     relax_substateT rlx_more;	  /* Next longer relax-state. */
 				  /* 0 means there is no 'next' relax-state. */
 } relax_typeS;
-
-#endif // _RELAX_H_
-
