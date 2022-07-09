@@ -30,6 +30,10 @@
 #include <mach-o/loader.h>
 #include <mach-o/fat.h>
 
+#include <string.h>
+#include <limits.h>
+#include <unistd.h>
+
 #include <string>
 #include <set>
 #include <string>

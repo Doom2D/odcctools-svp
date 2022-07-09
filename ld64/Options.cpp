@@ -30,6 +30,10 @@
 #include <vector>
 #include "config.h"
 
+#include <string.h>
+#include <limits.h>
+#include <unistd.h>
+
 #include "Options.h"
 
  __attribute__((noreturn))

@@ -21,9 +21,11 @@
  * @APPLE_LICENSE_HEADER_END@
  */
 
+#include <string.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <sys/time.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>

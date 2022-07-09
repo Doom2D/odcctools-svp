@@ -23,6 +23,9 @@
 
 #include <vector>
 
+#include <string.h>
+#include <stdio.h>
+
 #include "ObjectFile.h"
 
 namespace SectCreate {
