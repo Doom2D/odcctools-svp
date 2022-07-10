@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1999 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 1999-2003 Apple Computer, Inc.  All Rights Reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  * 
@@ -24,20 +24,20 @@
 #include "shlib.h"
 #endif /* SHLIB */
 /*
- * This file contains the routines to do generic relocation.  Which can be used
- * for such machines that have simple 1, 2, and 4 byte relocation lengths.
+ * This file contains the routines to do relocation for the arm.
  */
+#include <stdlib.h>
 #if !(defined(KLD) && defined(__STATIC__))
 #include <stdio.h>
 #include <mach/mach.h>
 #else /* defined(KLD) && defined(__STATIC__) */
 #include <mach/kern_return.h>
 #endif /* !(defined(KLD) && defined(__STATIC__)) */
-#include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 #include <mach-o/loader.h>
 #include <mach-o/reloc.h>
+#include <mach-o/arm/reloc.h>
 #include <mach-o/nlist.h>
 #include "stuff/bool.h"
 #include "stuff/bytesex.h"
@@ -50,11 +50,14 @@
 #include "symbols.h"
 #include "pass2.h"
 #include "generic_reloc.h"
+#include "arm_reloc.h"
 #include "indirect_sections.h"
 #include "dylibs.h"
 
+#define U_ABS(l) (((long)(l))<0 ? (unsigned long)(-(l)) : (l))
+
 /*
- * generic_reloc() relocates the contents of the specified section for the 
+ * arm_reloc() relocates the contents of the specified section for the 
  * relocation entries using the section map from the current object (cur_obj).
  *
  * Or if refs is not NULL it is being called by to get the addresses or
@@ -67,18 +70,19 @@
  */
 __private_extern__
 void
-generic_reloc(
+arm_reloc(
 char *contents,
 struct relocation_info *relocs,
 struct section_map *section_map,
-long pcrel_at_end_of_disp,
 struct live_refs *refs,
 unsigned long reloc_index)
 {
     unsigned long i, j, symbolnum, value, input_pc, output_pc;
+    unsigned long instruction, immediate, low_bit;
     struct nlist *nlists;
     char *strings;
-    enum bool force_extern_reloc;
+    enum bool force_extern_reloc, relocated_extern_thumb_symbol;
+    enum bool relocated_extern_arm_symbol;
     struct undefined_map *undefined_map;
     struct merged_symbol *merged_symbol;
     struct section_map *local_map, *pair_local_map;
@@ -86,28 +90,36 @@ unsigned long reloc_index)
     struct scattered_relocation_info *sreloc, *spair_reloc;
     unsigned long r_address, r_symbolnum, r_pcrel, r_length, r_extern,
 		  r_scattered, r_value, pair_r_symbolnum, pair_r_value;
-    enum reloc_type_generic r_type, pair_r_type;
+    enum reloc_type_arm r_type, pair_r_type;
+    unsigned long other_half;
     unsigned long offset;
+    unsigned long br14_disp_sign;
 
 #if defined(DEBUG) || defined(RLD)
 	/*
-	 * The compiler "warnings: `merged_symbol', `local_map' and `offset'
-	 * may be used uninitialized in this function" can safely be ignored
+	 * The compiler "warnings: ... may be used uninitialized in this
+	 * function" can safely be ignored
 	 */
 	merged_symbol = NULL;
 	local_map = NULL;
+	instruction = 0;
+	other_half = 0;
+	immediate = 0;
 	offset = 0;
 	pair_r_symbolnum = 0;
 	pair_r_value = 0;
-	pair_local_map = 0;
-#endif /* DEBUG */
+	pair_local_map = NULL;
+#endif /* defined(DEBUG) || defined(RLD) */
 
 	if(refs != NULL)
 	    memset(refs, '\0', sizeof(struct live_refs));
 	else
 	    reloc_index = 0;
 	for(i = reloc_index; i < section_map->s->nreloc; i++){
+	    br14_disp_sign = 0;
 	    force_extern_reloc = FALSE;
+	    relocated_extern_thumb_symbol = FALSE;
+	    relocated_extern_arm_symbol = FALSE;
 	    /*
 	     * Break out the fields of the relocation entry and set pointer to
 	     * the type of relocation entry it is (for updating later).
@@ -120,20 +132,19 @@ unsigned long reloc_index)
 		r_pcrel = sreloc->r_pcrel;
 		r_length = sreloc->r_length;
 		r_value = sreloc->r_value;
-		r_type = (enum reloc_type_generic)sreloc->r_type;
+		r_type = (enum reloc_type_arm)sreloc->r_type;
 		r_extern = 0;
 		/*
-		 * Since the r_value field is reserved in a GENERIC_RELOC_PAIR
+		 * Since the r_value field is reserved in a ARM_RELOC_PAIR
 		 * type to report the correct error a check for a stray
-		 * GENERIC_RELOC_PAIR relocation types needs to be done before
-		 * it is assumed that r_value is legal.  A GENERIC_RELOC_PAIR
-		 * only follows a GENERIC_RELOC_SECTDIFF or
-		 * GENERIC_RELOC_LOCAL_SECTDIFF relocation type and it
-		 * is an error to see one otherwise.
+		 * ARM_RELOC_PAIR relocation types needs to be done before
+		 * it is assumed that r_value is legal.  A ARM_RELOC_PAIR
+		 * only follows ARM_RELOC_{SECTDIFF,LOCAL_SECTDIFF} relocation
+		 * types and it is an error to see one otherwise.
 		 */
-		if(r_type == GENERIC_RELOC_PAIR){
-		    error_with_cur_obj("stray relocation GENERIC_RELOC_PAIR "
-			"entry (%lu) in section (%.16s,%.16s)", i,
+		if(r_type == ARM_RELOC_PAIR){
+		    error_with_cur_obj("stray relocation ARM_RELOC_PAIR entry "
+			"(%lu) in section (%.16s,%.16s)", i,
 			section_map->s->segname, section_map->s->sectname);
 		    continue;
 		}
@@ -177,24 +188,25 @@ unsigned long reloc_index)
 		r_length = reloc->r_length;
 		r_extern = reloc->r_extern;
 		r_symbolnum = reloc->r_symbolnum;
-		r_type = (enum reloc_type_generic)reloc->r_type;
+		r_type = (enum reloc_type_arm)reloc->r_type;
 		r_value = 0;
 	    }
 	    /*
-	     * GENERIC_RELOC_PAIR relocation types only follow a 
-	     * GENERIC_RELOC_SECTDIFF or GENERIC_RELOC_LOCAL_SECTDIFF
-	     * relocation type and it is an error to
-	     * see one otherwise.
+	     * ARM_RELOC_PAIR relocation types only follows ARM_RELOC_{SECTDIFF,
+	     * LOCAL_SECTDIFF} relocation types and it is an error to see one
+	     * otherwise.
 	     */
-	    if(r_type == GENERIC_RELOC_PAIR){
-		error_with_cur_obj("stray relocation GENERIC_RELOC_PAIR entry "
+	    if(r_type == ARM_RELOC_PAIR){
+		error_with_cur_obj("stray relocation ARM_RELOC_PAIR entry "
 		    "(%lu) in section (%.16s,%.16s)", i,
 		    section_map->s->segname, section_map->s->sectname);
 		continue;
 	    }
 	    /*
 	     * The r_address field is really an offset into the contents of the
-	     * section and must reference something inside the section.
+	     * section and must reference something inside the section (Note
+	     * that this is not the case for ARM_RELOC_PAIR entries but this
+	     * can't be one with the above checks).
 	     */
 	    if(r_address >= section_map->s->size){
 		error_with_cur_obj("r_address (0x%x) field of relocation entry "
@@ -205,19 +217,16 @@ unsigned long reloc_index)
 	    }
 	    /*
 	     * If this relocation type is to have a pair make sure it is there
-	     * and then break out it's fields.  Currently only the relocation
-	     * types GENERIC_RELOC_SECTDIFF and GENERIC_RELOC_LOCAL_SECTDIFF
-	     * can have a pair and itself and it's
-	     * pair must be scattered relocation types.
+	     * and then break out it's fields.
 	     */
-	    pair_r_type = (enum reloc_type_generic)0;
+	    pair_r_type = (enum reloc_type_arm)0;
 	    pair_reloc = NULL;
 	    spair_reloc = NULL;
-	    if(r_type == GENERIC_RELOC_SECTDIFF ||
-	       r_type == GENERIC_RELOC_LOCAL_SECTDIFF){
+	    if(r_type == ARM_RELOC_SECTDIFF ||
+	       r_type == ARM_RELOC_LOCAL_SECTDIFF){
 		if(r_scattered != 1){
 		    error_with_cur_obj("relocation entry (%lu) in section "
-			"(%.16s,%.16s) r_type is section difference but "
+			"(%.16s,%.16s) r_type is ARM_RELOC_SECTDIFF but "
 			"relocation entry not scattered type", i,
 			section_map->s->segname, section_map->s->sectname);
 		    continue;
@@ -228,9 +237,9 @@ unsigned long reloc_index)
 			spair_reloc = (struct scattered_relocation_info *)
 				      pair_reloc;
 			pair_reloc = NULL;
-			pair_r_type = (enum reloc_type_generic)
-				       spair_reloc->r_type;
+			pair_r_type = (enum reloc_type_arm)spair_reloc->r_type;
 			pair_r_value = spair_reloc->r_value;
+			other_half = spair_reloc->r_address;
 		    }
 		    else{
 			error_with_cur_obj("relocation entry (%lu) in section "
@@ -241,10 +250,10 @@ unsigned long reloc_index)
 		    }
 		}
 		if((pair_reloc == NULL && spair_reloc == NULL) ||
-		   pair_r_type != GENERIC_RELOC_PAIR){
+		   pair_r_type != ARM_RELOC_PAIR){
 		    error_with_cur_obj("relocation entry (%lu) in section "
 			"(%.16s,%.16s) missing following associated "
-			"GENERIC_RELOC_PAIR entry", i, section_map->s->segname,
+			"ARM_RELOC_PAIR entry", i, section_map->s->segname,
 			section_map->s->sectname);
 		    continue;
 		}
@@ -269,12 +278,6 @@ unsigned long reloc_index)
 		    return;
 		}
 	    }
-	    else if(r_type != GENERIC_RELOC_VANILLA){
-		error_with_cur_obj("r_type field of relocation entry %lu in "
-		    "section (%.16s,%.16s) invalid", i, section_map->s->segname,
-		    section_map->s->sectname);
-		continue;
-	    }
 	    /*
 	     * If r_extern is set this relocation entry is an external entry
 	     * else it is a local entry (or scattered entry).
@@ -286,7 +289,7 @@ unsigned long reloc_index)
 		 * r_symbolnum is an index into the input file's symbol table
 		 * of the symbol being refered to.  The symbol must be an
 		 * undefined or coalesced symbol to be used in an external
-		 * external relocation entry.
+		 * relocation entry.
 		 */
 		if(r_symbolnum >= cur_obj->symtab->nsyms){
 		    error_with_cur_obj("r_symbolnum (%lu) field of external "
@@ -326,8 +329,8 @@ unsigned long reloc_index)
 			merged_symbol = lookup_symbol(strings +
 					     nlists[symbolnum].n_un.n_strx);
 			if(merged_symbol->name_len == 0){
-			    fatal("internal error, in generic_reloc() failed "
-				  "to lookup coalesced symbol %s", strings +
+			    fatal("internal error, in arm_reloc() failed to "
+			          "lookup coalesced symbol %s", strings +
 				  nlists[symbolnum].n_un.n_strx);
 			}
 		    }
@@ -342,12 +345,11 @@ unsigned long reloc_index)
 			    return;
 			}
 			print_obj_name(cur_obj);
-			fatal("internal error, in generic_reloc() symbol index "
-			      "%lu in above file not in undefined map",
-			      symbolnum);
+			fatal("internal error, in arm_reloc() symbol index %lu "
+			    "in above file not in undefined map", symbolnum);
 		    }
 		}
-		if(refs == NULL &&
+		if(refs == NULL && 
 		   ((merged_symbol->nlist.n_type & N_TYPE) == N_SECT &&
 		    (get_output_section(merged_symbol->nlist.n_sect)->
 		     flags & SECTION_TYPE) == S_COALESCED)){
@@ -395,6 +397,18 @@ unsigned long reloc_index)
 		else{
 		    value = merged_symbol->nlist.n_value;
 		    /*
+		     * Pointers to thumb symbols must have their low bit set
+		     * only after they have been relocated.  Also arm BL 
+		     * instructions to thumb symbols must be conveted to BLX
+		     * instructions. This external relocation entry will be
+		     * relocated, so if it is for a thumb symbol then set
+		     * relocated_extern_thumb_symbol so it can be used later.
+		     */
+		    if((merged_symbol->nlist.n_desc & N_ARM_THUMB_DEF))
+			relocated_extern_thumb_symbol = TRUE;
+		    else
+			relocated_extern_arm_symbol = TRUE;
+		    /*
 		     * To know which type (local or scattered) of relocation
 		     * entry to convert this one to (if relocation entries are
 		     * saved) the offset to be added to the symbol's value is
@@ -403,42 +417,75 @@ unsigned long reloc_index)
 		     * it is assumed to reach out of the block and a scattered
 		     * relocation entry is used.
 		     */
-		    switch(r_length){
-		    case 0: /* byte */
-			offset = get_byte((char *)(contents + r_address));
-			break;
-		    case 1: /* word (2 byte) */
-			offset = get_short((short *)(contents + r_address));
-			break;
-		    case 2: /* long (4 byte) */
-			offset = get_long((long *)(contents + r_address));
-			break;
-		    default:
-			/* the error check is catched below */
-			break;
-		    }
-		    /*
-		     * If the offset is pc-relative then adjust it.
-		     */
-		    if(r_pcrel){
-			input_pc = section_map->s->addr + r_address;
-			if(pcrel_at_end_of_disp){
-			    switch(r_length){
-			    case 0: /* byte */
-				input_pc += sizeof(char);
-				break;
-			    case 1: /* word (2 byte) */
-				input_pc += sizeof(short);
-				break;
-			    case 2: /* long (4 byte) */
-				input_pc += sizeof(long);
-				break;
-			    default:
-				/* the error check is catched below */
-				break;
-			    }
+		    input_pc = section_map->s->addr + r_address;
+		    if(r_type == ARM_RELOC_VANILLA){
+			switch(r_length){
+			case 0: /* byte */
+			    offset = get_byte((char *)(contents + r_address));
+			    break;
+			case 1: /* word (2 byte) */
+			    offset = get_short((short *)(contents + r_address));
+			    break;
+			case 2: /* long (4 byte) */
+			    offset = get_long((long *)(contents + r_address));
+			    break;
+			default:
+			    /* the error check is catched below */
+			    break;
 			}
-			offset += input_pc;
+			if(r_pcrel)
+			    offset += input_pc;
+		    }
+		    else{
+			instruction = get_long((long *)(contents + r_address));
+			switch(r_type){
+			case ARM_RELOC_BR24:
+			    offset = instruction & 0x00ffffff;
+			    /* sign extend if needed */
+			    if((offset & 0x00800000) != 0)
+				offset |= 0xff000000;
+			    /* The value in the instruction is shifted by 2 */
+			    offset = offset << 2;
+			    /*
+			     * Note the pc added will be +8 from the pc of the
+			     * branch instruction.  And the assembler creating
+			     * this instruction takes that into account when
+			     * calculating the displacement in the instruction.
+			     */
+			    if(r_pcrel)
+				offset += input_pc;
+			    break;
+			case ARM_THUMB_RELOC_BR22:
+			    /*
+			     * The code below assumes ARM is little endian
+			     * such that "the first 16-bit thumb instruction"
+			     * is the low 16 bits and "the second 16-bit thumb	
+			     * instruction" is the high 16 bits of the 32-bits
+			     * in the variable instruction.
+			     */
+			    /* the first instruction has the upper eleven bits 
+			       of the two byte displacement */
+			    offset = (instruction & 0x7FF) << 12;
+			    /* sign extend if needed */
+			    if((offset & 0x400000) != 0)
+				offset |= 0xFF800000;
+			    /* the second instruction has the lower eleven bits 
+			        of the two byte displacement.  Add that times
+				two to get the offset added to the symbol */
+			    offset += 2*((instruction >> 16) & 0x7FF);
+			    /*
+			     * Note the pc added will be +4 from the pc of the
+			     * branch instruction.  And the assembler creating
+			     * this instruction takes that into account when
+			     * calculating the displacement in the instruction.
+			     */
+			    if(r_pcrel)
+				offset += input_pc;
+			    break;
+			default:
+			    /* the error check is catched below */
+			    break;
+			}
 		    }
 		}
 
@@ -481,36 +528,18 @@ unsigned long reloc_index)
 		    }
 		    local_map = &(cur_obj->section_maps[r_symbolnum - 1]);
 		    local_map->output_section->referenced = TRUE;
-		    if(local_map->s->flags & S_ATTR_DEBUG){
-			error_with_cur_obj("illegal reference to debug section,"
-			    " from non-debug section (%.16s,%.16s) via "
-			    "relocation entry (%lu) to section (%.16s,%.16s)",
-			    section_map->s->segname, section_map->s->sectname,
-			    i, local_map->s->segname, local_map->s->sectname);
-			return;
-		    }
 		    pair_local_map = NULL;
-		    if(r_type == GENERIC_RELOC_SECTDIFF ||
-		       r_type == GENERIC_RELOC_LOCAL_SECTDIFF){
+		    if(r_type == ARM_RELOC_SECTDIFF ||
+		       r_type == ARM_RELOC_LOCAL_SECTDIFF){
 			pair_local_map =
 			    &(cur_obj->section_maps[pair_r_symbolnum - 1]);
 			pair_local_map->output_section->referenced = TRUE;
-			if(pair_local_map->s->flags & S_ATTR_DEBUG){
-			    error_with_cur_obj("illegal reference to debug "
-				"section, from non-debug section (%.16s,%.16s) "
-				"via relocation entry (%lu) to section (%.16s,"
-				"%.16s)", section_map->s->segname,
-				section_map->s->sectname, i,
-				pair_local_map->s->segname,
-				pair_local_map->s->sectname);
-			    return;
-			}
 		    }
 		    if(local_map->nfine_relocs == 0 && 
 		       (pair_local_map == NULL ||
 			pair_local_map->nfine_relocs == 0) ){
-			if(r_type == GENERIC_RELOC_SECTDIFF ||
-			   r_type == GENERIC_RELOC_LOCAL_SECTDIFF){
+			if(r_type == ARM_RELOC_SECTDIFF ||
+			   r_type == ARM_RELOC_LOCAL_SECTDIFF){
 			    value = - local_map->s->addr
 				    + (local_map->output_section->s.addr +
 				       local_map->offset)
@@ -543,25 +572,6 @@ unsigned long reloc_index)
 					    + 
 					fine_reloc_output_offset(section_map,
 								 r_address);
-			    if(pcrel_at_end_of_disp){
-				switch(r_length){
-				case 0: /* byte */
-				    input_pc += sizeof(char);
-				    output_pc += sizeof(char);
-				    break;
-				case 1: /* word (2 byte) */
-				    input_pc += sizeof(short);
-				    output_pc += sizeof(short);
-				    break;
-				case 2: /* long (4 byte) */
-				    input_pc += sizeof(long);
-				    output_pc += sizeof(long);
-				    break;
-				default:
-				    /* the error check is catched below */
-				    break;
-				}
-			    }
 			}
 			else{
 			    input_pc = 0;
@@ -569,23 +579,86 @@ unsigned long reloc_index)
 			}
 			/*
 			 * Get the value of the expresion of the item to be
-			 * relocated (errors of r_length are checked later).
+			 * relocated.
 			 */
-			switch(r_length){
-			case 0: /* byte */
-			    value = get_byte((char *)(contents + r_address));
-			    break;
-			case 1: /* word (2 byte) */
-			    value = get_short((short *)(contents + r_address));
-			    break;
-			case 2: /* long (4 byte) */
-			    value = get_long((long *)(contents + r_address));
-			    break;
+			if(r_type == ARM_RELOC_VANILLA ||
+			   r_type == ARM_RELOC_SECTDIFF ||
+			   r_type == ARM_RELOC_LOCAL_SECTDIFF){
+			    switch(r_length){
+			    case 0: /* byte */
+				value = get_byte((char *)(contents +
+							  r_address));
+				break;
+			    case 1: /* word (2 byte) */
+				value = get_short((short *)(contents +
+							    r_address));
+				break;
+			    case 2: /* long (4 byte) */
+				value = get_long((long *)(contents +
+							  r_address));
+				break;
+			    default:
+				/* the error check is catched below */
+				break;
+			    }
 			}
-			if(r_type == GENERIC_RELOC_SECTDIFF ||
-			   r_type == GENERIC_RELOC_LOCAL_SECTDIFF){
+			else{
+			    instruction = get_long((long *)(contents +
+							    r_address));
+			    switch(r_type){
+			    case ARM_RELOC_BR24:
+				value = instruction & 0x00ffffff;
+				if((value & 0x00800000) != 0)
+				    value |= 0xff000000;
+				/* The value (displacement) is shifted by 2 */
+				value = value << 2;
+				/*
+				 * For a BLX instruction, set bit[1] of the
+				 * result to the H bit.
+				 */
+				if((instruction & 0xff000000) == 0xfb000000)
+				    value |= 0x2;
+				/* The pc added will be +8 from the pc */
+				value += 8;
+				break;
+			    case ARM_THUMB_RELOC_BR22:
+				/*
+				 * The code below assumes ARM is little endian
+				 * such that "the first 16-bit thumb
+				 * instruction" is the low 16 bits and "the
+				 * second 16-bit thumb instruction" is the high
+				 * 16 bits of the 32-bits in the variable
+				 * instruction.
+				 */
+				/* the first instruction has the upper eleven
+				   bits of the two byte displacement */
+				value = (instruction & 0x7FF) << 12;
+				/* sign extend if needed */
+				if((value & 0x400000) != 0)
+				    value |= 0xFF800000;
+				/* the second instruction has the lower eleven
+				   bits of the two byte displacement.  Add that 
+				   times two to get the target address */
+				value += 2*((instruction >> 16) & 0x7FF);
+				/* The pc added will be +4 from the pc */
+				value += 4;
+				/*
+				 * For BLX, the resulting address is forced to
+				 * be word-aligned by clearing bit[1].
+				 */
+				if(((instruction & 0x18000000) == 0x08000000) &&
+				   ((input_pc + value) & 0x2))
+				  value -= 2;
+				break;
+			    default:
+				/* the error check is catched below */
+				break;
+			    }
+			}
+			if(r_type == ARM_RELOC_SECTDIFF ||
+			   r_type == ARM_RELOC_LOCAL_SECTDIFF){
 			    /*
-			     * For GENERIC_RELOC_SECTDIFF's the item to be
+			     * For ARM_RELOC_SECTDIFF's the item to be
 			     * relocated, in value, is the value of the
 			     * expression:
 			     *     r_value - pair_r_value + offset
@@ -624,9 +697,9 @@ unsigned long reloc_index)
 				 * respect to indirect sections.
 				 */
 				legal_reference(section_map, r_address,
-				    local_map, r_value - local_map->s->addr +
-				    offset, i,
-				    r_type != GENERIC_RELOC_LOCAL_SECTDIFF);
+				    local_map, r_value - local_map->s->addr,
+				    i,
+				    r_type != ARM_RELOC_LOCAL_SECTDIFF);
 				value = fine_reloc_output_address(local_map,
 					    r_value - local_map->s->addr,
 					    local_map->output_section->s.addr);
@@ -707,35 +780,160 @@ unsigned long reloc_index)
 			    value -= output_pc;
 			    value += offset;
 			}
-			switch(r_length){
-			case 0: /* byte */
-			    if( (value & 0xffffff00) &&
-			       ((value & 0xffffff80) != 0xffffff80))
-				error_with_cur_obj("relocation for entry %lu in"
-				    " section (%.16s,%.16s) does not fit in 1 "
-				    "byte", i, section_map->s->segname,
+			if(r_type == ARM_RELOC_VANILLA ||
+			   r_type == ARM_RELOC_LOCAL_SECTDIFF ||
+			   r_type == ARM_RELOC_SECTDIFF){
+			    switch(r_length){
+			    case 0: /* byte */
+				if( (value & 0xffffff00) &&
+				   ((value & 0xffffff80) != 0xffffff80))
+				    error_with_cur_obj("relocation for entry "
+					"%lu in section (%.16s,%.16s) does not "
+					"fit in 1 byte", i,
+					section_map->s->segname,
+					section_map->s->sectname);
+				set_byte((char *)(contents + r_address), value);
+				break;
+			    case 1: /* word (2 byte) */
+				if( (value & 0xffff0000) &&
+				   ((value & 0xffff8000) != 0xffff8000))
+				    error_with_cur_obj("relocation for entry "
+					"%lu in section (%.16s,%.16s) does not "
+					"fit in 2 bytes", i,
+					section_map->s->segname,
+					section_map->s->sectname);
+				set_short((short *)(contents + r_address),
+					  value);
+				break;
+			    case 2: /* long (4 byte) */
+				set_long((long *)(contents + r_address), value);
+				break;
+			    default:
+				error_with_cur_obj("r_length field of "
+				    "relocation entry %lu in section (%.16s,"
+				    "%.16s) invalid", i,
+				    section_map->s->segname,
 				    section_map->s->sectname);
-			    set_byte((char *)(contents + r_address), value);
-			    break;
-			case 1: /* word (2 byte) */
-			    if( (value & 0xffff0000) &&
-			       ((value & 0xffff8000) != 0xffff8000))
-				error_with_cur_obj("relocation for entry %lu in"
-				    " section (%.16s,%.16s) does not fit in 2 "
-				    "bytes", i, section_map->s->segname,
-				    section_map->s->sectname);
-			    set_short((short *)(contents + r_address), value);
-			    break;
-			case 2: /* long (4 byte) */
-			    set_long((long *)(contents + r_address), value);
-			    break;
-			default:
-			    error_with_cur_obj("r_length field of relocation "
-				"entry %lu in section (%.16s,%.16s) invalid",
-				i, section_map->s->segname,
-				section_map->s->sectname);
-			    return;
+				return;
+			    }
 			}
+			else{
+			    switch(r_type){
+			    case ARM_RELOC_BR24:
+				/* The pc added will be +8 from the pc */
+				value -= 8;
+				/*
+				 * An ARM BLX targetting an ARM symbol or
+				 * a local symbol needs to be converted to a
+				 * BL.  This could happen if it was originally
+				 * targetting a thumb stub which will be
+				 * optimized away.
+				 */
+				if(((fine_reloc_arm(local_map,
+					r_value - local_map->s->addr) == TRUE) ||
+				    (fine_reloc_local(local_map,
+					r_value - local_map->s->addr) == TRUE)) &&
+				   ((instruction & 0xfe000000) == 0xfa000000))
+				    instruction = 0xeb000000;
+				/*
+				 * For arm branch instructions if the target is 
+				 * a thumb symbol it must be converted to a
+				 * branch and exchange instruction (unless it
+				 * already is one).
+				 */
+				if((fine_reloc_thumb(local_map,
+					r_value - local_map->s->addr) == TRUE) ||
+				   ((instruction & 0xfe000000) == 0xfa000000)){
+				    /*
+				     * Only unconditional BL can be converted
+				     * to BLX
+				     */
+				    if(((instruction & 0xff000000) != 0xeb000000) &&
+				       ((instruction & 0xfe000000) != 0xfa000000))
+					error_with_cur_obj("relocation error "
+					    "for relocation entry %lu in "
+					    "section (%.16s,%.16s) (branch "
+					    "cannot be converted to BLX)", i,
+					    section_map->s->segname,
+					    section_map->s->sectname);
+				    /*
+				     * The H bit of the BLX instruction (bit 24)
+				     * contains bit 1 of the target address.
+				     */
+				    instruction = (0xfa000000 |
+						   ((value & 0x2) << 23));
+				    /*
+				     * This code assumes the thumb symbol
+				     * address is two byte aligned.  This next
+				     * line clears the last two bits so the next
+				     * test will not cause an error
+				     */
+				    value &= ~0x2;
+				}
+				if((value & 0x3) != 0)
+				    error_with_cur_obj("relocation error "
+					"for relocation entry %lu in section "
+					"(%.16s,%.16s) (displacement not a "
+					"multiple of 4 bytes)", i,
+					section_map->s->segname,
+					section_map->s->sectname);
+				if((value & 0xfe000000) != 0xfe000000 &&
+				   (value & 0xfe000000) != 0x00000000)
+				    error_with_cur_obj("relocation overflow "
+					"for relocation entry %lu in section "
+					"(%.16s,%.16s) (displacement too large)"
+					, i, section_map->s->segname,
+					section_map->s->sectname);
+				instruction = (instruction & 0xff000000) |
+					      ((value >> 2) & 0x00ffffff);
+				break;
+			    case ARM_THUMB_RELOC_BR22:
+				/* The pc added will be +4 from the pc */
+				value -= 4;
+				/*
+				 * Here we have a BL instruction targetting an
+				 * arm symbol -- convert it to a BLX
+				 */
+				if((fine_reloc_arm(local_map,
+					r_value - local_map->s->addr) == TRUE) &&
+				   ((instruction & 0xf800f800) == 0xf800f000))
+				    instruction &= 0xefffffff;
+				/*
+				 * Here we have a BLX instruction targetting a
+				 * thumb symbol or a local symbol (which we will
+				 * boldly assume to be thumb in the absence of
+				 * any evidence to the contrary)  -- convert it
+				 * to a BL
+				 */
+				if(((fine_reloc_thumb(local_map,
+					r_value - local_map->s->addr) == TRUE) ||
+				    (fine_reloc_local(local_map,
+					r_value - local_map->s->addr) == TRUE)) &&
+				   ((instruction & 0xf800f800) == 0xe800f000))
+				    instruction |= 0x10000000;
+				/* immediate must be multiple of four bytes.
+				 * This enforces the requirement that
+				 * instruction[0] must be zero for a BLX.
+				 */
+				if((instruction & 0xf800f800) == 0xe800f000 &&
+				   (value & 0x2) != 0)
+				    value += 2;
+				instruction = (instruction & 0xf800f800) |
+					      (value & 0x7ff000) >> 12 |
+					      (value & 0xffe) << 15;
+				break;
+			    default:
+				error_with_cur_obj("r_type field of "
+				    "relocation entry %lu in section (%.16s,"
+				    "%.16s) invalid", i,
+				    section_map->s->segname,
+				    section_map->s->sectname);
+				return;
+			    }
+			    set_long((long *)(contents + r_address),
+				     instruction);
+			}
+
 			goto update_reloc;
 		    }
 		}
@@ -760,35 +958,214 @@ unsigned long reloc_index)
 			        fine_reloc_output_offset(section_map,
 							 r_address));
 	    }
-	    switch(r_length){
-	    case 0: /* byte */
-		value += get_byte((char *)(contents + r_address));
-		if( (value & 0xffffff00) &&
-		   ((value & 0xffffff80) != 0xffffff80))
+	    if(r_type == ARM_RELOC_VANILLA ||
+	       r_type == ARM_RELOC_LOCAL_SECTDIFF ||
+	       r_type == ARM_RELOC_SECTDIFF){
+		/*
+		 * Pointers to thumb symbols must have their low bit set, but
+		 * only after they have been relocated.  Code above determined
+		 * if this is and external relocation entry for a thumb symbol
+		 * that is being relocated and if so set 
+		 * relocated_extern_thumb_symbol.  So now if this is a VANILLA
+		 * relocation entry for a pointer set the low bit from
+		 * relocated_extern_thumb_symbol.
+		 */
+		if(r_type == ARM_RELOC_VANILLA)
+		    low_bit = (relocated_extern_thumb_symbol == TRUE) ? 1 : 0;
+		else
+		    low_bit = 0;
+		/*
+		 * This is part of the cctools_aek-thumb-hack branch.  It seems
+		 * like a reasonable error check but I don't see how it could
+		 * ever get triggered by any code going though the assember.
+		 */
+		if(r_type == ARM_RELOC_VANILLA && 
+		   relocated_extern_thumb_symbol == TRUE && r_pcrel)
 		    error_with_cur_obj("relocation for entry %lu in section "
-			"(%.16s,%.16s) does not fit in 1 byte", i,
+			"(%.16s,%.16s) is VANILLA PC-relative to a thumb "
+			"symbol %s", i, section_map->s->segname,
+			section_map->s->sectname,
+			merged_symbol->nlist.n_un.n_name);
+		switch(r_length){
+		case 0: /* byte */
+		    value += get_byte((char *)(contents + r_address));
+		    if( (value & 0xffffff00) &&
+		       ((value & 0xffffff80) != 0xffffff80))
+			error_with_cur_obj("relocation for entry %lu in section"
+			    " (%.16s,%.16s) does not fit in 1 byte", i,
+			    section_map->s->segname, section_map->s->sectname);
+		    set_byte((char *)(contents + r_address), value | low_bit);
+		    break;
+		case 1: /* word (2 byte) */
+		    value += get_short((short *)(contents + r_address));
+		    if( (value & 0xffff0000) &&
+		       ((value & 0xffff8000) != 0xffff8000))
+			error_with_cur_obj("relocation for entry %lu in section"
+			    " (%.16s,%.16s) does not fit in 2 bytes", i,
+			    section_map->s->segname, section_map->s->sectname);
+		    set_short((short *)(contents + r_address), value | low_bit);
+		    break;
+		case 2: /* long (4 byte) */
+		    value += get_long((long *)(contents + r_address));
+		    set_long((long *)(contents + r_address), value | low_bit);
+		    break;
+		default:
+		    error_with_cur_obj("r_length field of relocation entry %lu "
+			"in section (%.16s,%.16s) invalid", i,
 			section_map->s->segname, section_map->s->sectname);
-		set_byte((char *)(contents + r_address), value);
-		break;
-	    case 1: /* word (2 byte) */
-		value += get_short((short *)(contents + r_address));
-		if( (value & 0xffff0000) &&
-		   ((value & 0xffff8000) != 0xffff8000))
-		    error_with_cur_obj("relocation for entry %lu in section "
-			"(%.16s,%.16s) does not fit in 2 bytes", i,
-			section_map->s->segname, section_map->s->sectname);
-		set_short((short *)(contents + r_address), value);
-		break;
-	    case 2: /* long (4 byte) */
-		value += get_long((long *)(contents + r_address));
-		set_long((long *)(contents + r_address), value);
-		break;
-	    default:
-		error_with_cur_obj("r_length field of relocation entry %lu in "
-		    "section (%.16s,%.16s) invalid", i,
-		    section_map->s->segname, section_map->s->sectname);
-		return;
+		    return;
+		}
 	    }
+	    /*
+	     * Do arm specific relocation based on the r_type.
+	     */
+	    else{
+		instruction = get_long((long *)(contents + r_address));
+		switch(r_type){
+		case ARM_RELOC_BR24:
+		    immediate = instruction & 0x00ffffff;
+		    if((immediate & 0x00800000) != 0)
+			immediate |= 0xff000000;
+		    /* The value in the instruction is shifted by 2 */
+		    immediate = immediate << 2;
+		    /* In a BLX, bit 1 of the immediate is at bit 24
+		     * of the instruction.
+		     */
+		    if((instruction & 0xfe000000) == 0xfa000000)
+			immediate |= (instruction & 0x01000000) >> 23;
+		    immediate += value;
+		    /*
+		     * Here we have a BLX instruction that targets an
+		     * arm symbol -- convert it to a BL instruction.
+		     */
+		    if((r_extern == TRUE) &&
+		       (relocated_extern_arm_symbol == TRUE) &&
+		       ((instruction & 0xfe000000) == 0xfa000000))
+			instruction = 0xeb000000;
+		    /*
+		     * For arm branch instructions if the target is a thumb 
+		     * symbol it must be converted to a branch and exchange
+		     * instruction (unless it already is one).
+		     */
+		    else if(((r_extern == TRUE) &&
+			     (relocated_extern_thumb_symbol == TRUE)) ||
+			    ((instruction & 0xfe000000) == 0xfa000000)){
+			/* only unconditional BL can be converted to BLX */
+			if(((instruction & 0xff000000) != 0xeb000000) &&
+			   ((instruction & 0xfe000000) != 0xfa000000))
+			    error_with_cur_obj("relocation error for relocation"
+				" entry %lu in section (%.16s,%.16s) (branch "
+				"cannot be converted to BLX)", i,
+				section_map->s->segname,
+				section_map->s->sectname);
+			/* the H bit of the BLX instruction (bit 24) contains 
+			   bit 1 of the target address */
+			instruction = (0xfa000000 | ((immediate & 0x2) << 23));
+			/* this code assumes the thumb symbol address is two
+			   byte aligned.  This next line clears the last two
+			   bits so the next test will not cause an error */
+			immediate &= ~0x2;
+		    }
+		    if((immediate & 0x3) != 0)
+			error_with_cur_obj("relocation error for relocation "
+			    "entry %lu in section (%.16s,%.16s) (displacement "
+			    "not a multiple of 4 bytes)", i,
+			    section_map->s->segname, section_map->s->sectname);
+		    if((immediate & 0xfe000000) != 0xfe000000 &&
+		       (immediate & 0xfe000000) != 0x00000000)
+			error_with_cur_obj("relocation overflow for relocation "
+			    "entry %lu in section (%.16s,%.16s) (displacement "
+			    "too large)", i, section_map->s->segname,
+			    section_map->s->sectname);
+		    instruction = (instruction & 0xff000000) |
+		    		  (immediate & 0x03ffffff) >> 2;
+		    break;
+		case ARM_THUMB_RELOC_BR22:
+		    /*
+		     * The code below assumes ARM is little endian such that
+		     * "the first 16-bit thumb instruction" is the low 16 bits
+		     * and "the second 16-bit thumb instruction" is the high 16 
+		     * bits of the 32-bits in the variable instruction.
+		     */
+		    /* the first instruction has the upper eleven bits of the
+		       two byte displacement */
+		    immediate = (instruction & 0x7FF) << 12;
+		    /* sign extend if needed */
+		    if((immediate & 0x400000) != 0)
+			immediate |= 0xFF800000;
+		    /* the second instruction has the lower eleven bits of the
+		       two byte displacement.  Add that times two to get the
+		       target address */
+		    immediate += 2*((instruction >> 16) & 0x7FF);
+		    /*
+		     * For BLX, the resulting address is forced to be word-
+		     * aligned by clearing bit[1].
+		     */
+		    if((instruction & 0xf800f800) == 0xe800f000 &&
+		       (r_address & 0x2))
+			immediate -= 2;
+		    immediate += value;
+		    /*
+		     * The target address for a thumb branch must be to a
+		     * two-byte address.
+		     */
+		    if((immediate & 0x1) != 0)
+			error_with_cur_obj("relocation error for relocation "
+			    "entry %lu in section (%.16s,%.16s) (displacement "
+			    "not a multiple of 2 bytes)", i,
+			    section_map->s->segname, section_map->s->sectname);
+		    /*
+		     * Here we have a BLX instruction that targets a
+		     * thumb symbol -- convert it to a BL instruction.
+		     */
+		    if((r_extern == TRUE) &&
+		       (relocated_extern_thumb_symbol == TRUE) &&
+		       ((instruction & 0xf800f800) == 0xe800f000))
+			instruction |= 0x10000000;
+		    /*
+		     * For thumb branch instructions if the target is not a
+		     * thumb symbol (an arm symbol) it must be converted to a
+		     * branch and exchange instruction (if it is not already
+		     * one).
+		     */
+		    if(r_extern == TRUE &&
+		       relocated_extern_arm_symbol == TRUE &&
+		       (instruction & 0xf800f800) != 0xe800f000){
+			/* Make sure we have a high+low BL */
+			if((instruction & 0xf800f800) != 0xf800f000)
+			    error_with_cur_obj("relocation error for relocation"
+				" entry %lu in section (%.16s,%.16s) (unknown "
+				"branch type)", i, section_map->s->segname, 
+				section_map->s->sectname);
+			/* Convert BL to BLX: clear top H bit of second insr */
+			instruction &= 0xefffffff;
+		    }
+		    /* immediate must be multiple of four bytes.
+		     * This enforces the requirement that
+		     * instruction[0] must be zero for a BLX.
+		     */
+		    if((instruction & 0xf800f800) == 0xe800f000 &&
+		       (immediate & 0x2) != 0)
+			immediate += 2;
+		    if((immediate & 0xffc00000) != 0xffc00000 &&
+		       (immediate & 0xffc00000) != 0x00000000)
+			error_with_cur_obj("relocation overflow for relocation "
+			    "entry %lu in section (%.16s,%.16s) (displacement "
+			    "too large)", i, section_map->s->segname,
+			    section_map->s->sectname);
+		    instruction = (instruction & 0xf800f800) |
+				  (immediate & 0x7ff000) >> 12 |
+				  (immediate & 0xffe) << 15;
+		    break;
+		default:
+		    error_with_cur_obj("r_type field of relocation entry %lu "
+			"in section (%.16s,%.16s) invalid", i,
+			section_map->s->segname, section_map->s->sectname);
+		    continue;
+		}
+		set_long((long *)(contents + r_address), instruction);
+	    }
+
 	    /*
 	     * If relocation entries are to be saved in the output file then
 	     * update the entry for the output file.
@@ -800,7 +1177,7 @@ update_reloc:
 		if(r_extern){
 		    /*
 		     * If we are prebinding and this is a lazy pointer section
-		     * change the relocation entry to a GENERIC_RELOC_PB_LA_PTR
+		     * change the relocation entry to a ARM_RELOC_PB_LA_PTR
 		     * type.  This stuffs the value of the lazy pointer as it
 		     * wouldn't be prebound in the r_value field.  So if the
 		     * prebounding can't be used at runtime the value of the
@@ -812,16 +1189,10 @@ update_reloc:
 			sreloc = (struct scattered_relocation_info *)reloc;
 			r_scattered = 1;
 			sreloc->r_scattered = r_scattered;
-			if((r_address & 0x00ffffff) != r_address)
-			    error_with_cur_obj("Can't create valid output "
-				"file (r_address field of relocation "
-				"entry %lu in section (%.16s,%.16s) would "
-				"overflow)", i, section_map->s->segname,
-				section_map->s->sectname);
 			sreloc->r_address = r_address;
 			sreloc->r_pcrel = r_pcrel;
 			sreloc->r_length = r_length;
-			sreloc->r_type = GENERIC_RELOC_PB_LA_PTR;
+			sreloc->r_type = ARM_RELOC_PB_LA_PTR;
 			sreloc->r_value = value;
 		    }
 		    /*
@@ -871,17 +1242,10 @@ update_reloc:
 					 reloc;
 				r_scattered = 1;
 				sreloc->r_scattered = r_scattered;
-				if((r_address & 0x00ffffff) != r_address)
-				    error_with_cur_obj("Can't create valid "
-					"output file (r_address field of "
-					"relocation entry %lu in section "
-					"(%.16s,%.16s) would overflow)", i,
-					section_map->s->segname,
-					section_map->s->sectname);
 				sreloc->r_address = r_address;
 				sreloc->r_pcrel = r_pcrel;
 				sreloc->r_length = r_length;
-				sreloc->r_type = 0;
+				sreloc->r_type = r_type;
 				sreloc->r_value = merged_symbol->nlist.n_value;
 			    }
 			}
@@ -894,7 +1258,7 @@ update_reloc:
 		else if(r_scattered == 0){
 		    /*
 		     * If we are prebinding and this is a lazy pointer section
-		     * change the relocation entry to a GENERIC_RELOC_PB_LA_PTR
+		     * change the relocation entry to a ARM_RELOC_PB_LA_PTR
 		     * type.  This stuffs the value of the lazy pointer as it
 		     * wouldn't be prebound in the r_value field.  So if the
 		     * prebounding can't be used at runtime the value of the
@@ -906,16 +1270,10 @@ update_reloc:
 			sreloc = (struct scattered_relocation_info *)reloc;
 			r_scattered = 1;
 			sreloc->r_scattered = r_scattered;
-			if((r_address & 0x00ffffff) != r_address)
-			    error_with_cur_obj("Can't create valid output "
-				"file (r_address field of relocation "
-				"entry %lu in section (%.16s,%.16s) would "
-				"overflow)", i, section_map->s->segname,
-				section_map->s->sectname);
 			sreloc->r_address = r_address;
 			sreloc->r_pcrel = r_pcrel;
 			sreloc->r_length = r_length;
-			sreloc->r_type = GENERIC_RELOC_PB_LA_PTR;
+			sreloc->r_type = ARM_RELOC_PB_LA_PTR;
 			sreloc->r_value = value;
 		    }
 		    /*
@@ -996,52 +1354,48 @@ update_reloc:
 		}
 		else{
 		    if(section_map->nfine_relocs == 0){
-			if(((sreloc->r_address + section_map->offset) &
-			    0x00ffffff) !=
-			    sreloc->r_address + section_map->offset)
-			    error_with_cur_obj("Can't create valid output "
-				"file (r_address field of relocation "
-				"entry %lu in section (%.16s,%.16s) would "
-				"overflow)", i, section_map->s->segname,
-				section_map->s->sectname);
+			/* this can overflow the 24-bit sreloc->r_address */
 			sreloc->r_address += section_map->offset;
 		    }
 		    else{
-			r_address = fine_reloc_output_offset(section_map,
-							     r_address);
-			if((r_address & 0x00ffffff) != r_address)
-			    error_with_cur_obj("Can't create valid output "
-				"file (r_address field of relocation "
-				"entry %lu in section (%.16s,%.16s) would "
-				"overflow)", i, section_map->s->segname,
-				section_map->s->sectname);
-			sreloc->r_address = r_address;
+			sreloc->r_address =fine_reloc_output_offset(section_map,
+								    r_address);
 		    }
 		}
 		/*
 		 * If their was a paired relocation entry then update the
 		 * paired relocation entry.
 		 */
-		if(pair_r_type == GENERIC_RELOC_PAIR){
-		    if(spair_reloc != NULL){
-			/*
-			 * For scattered relocation entries the r_value field is
-			 * relocated.
-			 */
-			if(pair_local_map->nfine_relocs == 0)
-			    spair_reloc->r_value +=
-				- pair_local_map->s->addr
-				+ (pair_local_map->output_section->s.addr +
-				   pair_local_map->offset);
-			else
-			    spair_reloc->r_value =
-				fine_reloc_output_address(pair_local_map,
-				    pair_r_value - pair_local_map->s->addr,
-				    pair_local_map->output_section->s.addr);
+		if(pair_r_type == ARM_RELOC_PAIR){
+		    if(pair_reloc != NULL){
+			/* I don't think arm has any pairs that are not
+			   scattered relocs so this should never happen */
+			pair_reloc->r_address = other_half;
+		    }
+		    else if(spair_reloc != NULL){
+			if(r_type == ARM_RELOC_SECTDIFF ||
+			   r_type == ARM_RELOC_LOCAL_SECTDIFF){
+			    /*
+			     * For ARM_RELOC_SECTDIFF relocation entries (which
+			     * are always scattered types) the r_value field is
+			     * relocated.
+			     */
+			    if(pair_local_map->nfine_relocs == 0)
+				spair_reloc->r_value +=
+				    - pair_local_map->s->addr
+				    + (pair_local_map->output_section->s.addr +
+				       pair_local_map->offset);
+			    else
+				spair_reloc->r_value =
+				    fine_reloc_output_address(pair_local_map,
+					pair_r_value - pair_local_map->s->addr,
+					pair_local_map->output_section->s.addr);
+			}
 		    }
 		    else{
-			fatal("internal error, in generic_reloc() pair_r_type "
-			    "is GENERIC_RELOC_PAIR but spair_reloc is NULL");
+			fatal("internal error, in arm_reloc() pair_r_type "
+			    "is ARM_RELOC_PAIR but pair_reloc and spair_reloc "
+			    "are NULL");
 		    }
 		}
 	    }
@@ -1051,16 +1405,7 @@ update_reloc:
 	     * so skip it by incrementing the index of the relocation entry that
 	     * is being processed.
 	     */
-	    if(pair_r_type == GENERIC_RELOC_PAIR)
+	    if(pair_r_type == ARM_RELOC_PAIR)
 		i++;
 	}
-}
-
-__private_extern__
-int
-undef_bsearch(
-const unsigned long *index,
-const struct undefined_map *undefined_map)
-{
-	return(*index - undefined_map->index);
 }

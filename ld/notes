@@ -23,6 +23,231 @@ Build problems:
 - For m68k builds -finline-functions crashes the compiler (used in the Makefile
   on the ld_build target).
 
+Changes for the 5.25 release (the cctools-695 release):
+- Changed the Makefile to use -iwithsysroot as part of the KERN flags.
+
+Changes for the 5.25 release (the cctools-681 release):
+- Removed all __OPEN_SOURCE__ references in Makefile, notes, objects.c,
+  objects.h, sections.c, symbols.c, layout.c, ld.c and arm_reloc .
+
+Changes for the 5.25 release (the cctools-679.3 release):
+- Changed the Makefile to test OLD_LIBKLD pass down from the upper Makefile
+  so to not build libkld when OLD_LIBKLD is NO.  Radar bug #5698612.
+
+Changes for the 5.25 release (the cctools-677 release):
+- Changed the Makefile to not use -Wno-long-double and -no-cpp-precomp .
+  Radar bug #5563553.
+
+Changes for the 5.25 release (the cctools-676 release):
+- Changed check_cur_obj() in pass1.c to know about S_DTRACE_DOF section types
+  enough to not cause an error about unknown section type.
+
+Changes for the 5.25 release (the cctools-673 release):
+- Changed the sources so the arm stuff is not in the open source version.
+  Radar bug #5326431.
+  - Changed the Makefile to #ifndef __OPEN_SOURCE__ out the arm files
+  - Added #ifndef __OPEN_SOURCE__ to the following files to bracket arm code:
+    layout.c, ld.c, objects.c, objects.h, sections.c, symbols.c and arm_reloc.c.
+
+Changes for the 5.24 release (the cctools-663 release):
+- Changed the code in ld.[ch], pass1.c, symbols.c, layout.c and pass2.c for
+  the new get_macosx_deployment_target() interface.  Radar bug #5132019.
+
+Changes for the 5.24 release (the cctools-662 release):
+- Changed kld so it will propagate the LC_UUID from the last object file being
+  linked into the output.  Radar bug #5137807.
+  - Changed check_cur_obj() in pass1.c for #ifdef KLD to always clear the
+    output_uuid_info to zeros and then if the object file being checked has an
+    LC_UUID command copy that into the output_uuid_info.
+  - Changed layout() in layout.c for #ifndef KLD so it does not clear the
+    output_uuid_info and create the uuid load command if the
+    output_uuid_info.uuid_command.cmdsize is non-zero.
+
+Changes for the 5.24 release (the cctools-653 release):
+- Backed out the change for Radar bug #4930693 in internal_kld_load() in kld.c
+  to #ifdef KLD so that RLD_DEBUG_OUTPUT_FILENAME_flag is always set to 1.  This
+  was causing problems the way the prelinked kernel is generated.  Radar bug
+  #4930693.
+- Updated dylibs.c and pass1.c to handle the LC_REEXPORT_DYLIB load command.
+  Radar bug #4986624.
+
+Changes for the 5.24 release (the cctools-651 release):
+- Changed pass1() in pass1.c to swap the load command part of load commands
+  it doen't look at so when the other code in merge_dylib() in dylibs.c steps
+  over them it does not crash.  Radar bug #4953247.
+
+Changes for the 5.24 release (the cctools-650 release):
+- Changed internal_kld_load() in kld.c to #ifdef KLD so that
+  RLD_DEBUG_OUTPUT_FILENAME_flag is always set to 1.  Radar bug #4930693.
+
+Changes for the 5.24 release (the cctools-649 release):
+- Added some checks in generic_reloc.c to cause an error if the r_address field
+  were to be truncated.  Radar bug #4921122.
+- Fixed an internal error when using -s and a private external symbol is marked
+  with REFERENCED_DYNAMICALLY.  The change was in output_merged_symbols() in
+  symbols.c to not save a private external that has REFERENCED_DYNAMICALLY set
+  so this matches what assign_output_symbol_indexes() did for the -s case and
+  does not get the internal error when trying to find the string for this
+  symbol.  Radar bug #4885434.
+
+Changes for the 5.24 release (the cctools-639 release):
+- Added support for -install_name, -compatibility_version, -current_version
+  and -noall_load. Radar bug #4758790
+
+Changes for the 5.24 release (the cctools-636 release):
+- Fixed the check added below for warning about shared libraries with no table
+  of contents entries to not issue that warning when the shared library does not
+  defined any external symbols (which is the case for umbrella's).  Radar bug
+  #4733384.
+
+Changes for the 5.24 release (the cctools-634 release):
+- Changed check_cur_obj() in pass1.c to add a case statement for
+  LC_SEGMENT_SPLIT_INFO and simply ignore it as it is not looked at for linking.
+  Also added a warning for shared libraries with no table of contents entries
+  saying can't resolve symbols from it.  Radar bug #4695477.
+
+Changes for the 5.24 release (the cctools-633 release):
+- Changed indirect_sections.c and pass1.c to deal with the change of type for
+  indirect symbols to uint32_t * when ported to 64-bit. Radar bug #4407440.
+
+Changes for the 5.24 release (the cctools-631 release):
+- Fixed a bug with the symbol align_to_input_mod() not being defined for RLD
+  builds.  The fix was to add #ifdef RLD around it in sections.c.  Radar bug
+ #4685060
+
+Changes for the 5.24 release (the cctools-629 release):
+- Fixed a bug that did not get the internal alignment correct for fine reloc
+  blocks in coalesced sections.  coalesced_section_merge() in
+  coalesced_sections.c needed to use the align_to_input_mod() routine that was
+  in sections.c instead of calling round() in two places.  Radar bug #4599790.
+
+Changes for the 5.24 release (the cctools-626 release):
+- Changed check_cur_obj() in pass1.c to add a case statement for
+  LC_CODE_SIGNATURE and simply ignore it as it is not looked at for linking.
+  Radar bug #4588023.
+
+Changes for the 5.24 release (the cctools-623 release):
+- Changed the Makefile it installs in /usr/bin/ld_classic . Radar bug #4606627.
+
+Changes for the 5.23 release (the cctools-619 release):
+- Fixed a bug that caused the "internal error: output_local_symbols()'
+  inconsistent local symbol count" when discarding a weak symbol from an object
+  file for a symbol in a shared library.  The fix was to remove the call to
+  maybe_remove_dwarf_symbol() in merge_dylib_module_symbols() in symbols.c 
+  and let this call happen when it get to the label
+  use_symbol_definition_from_this_dylib.  The same change was also done in
+  merge_bundle_loader_symbols() in symbols.c .  Radar bug #4570143.
+- Fixed a bug in the parsing of the -allow_stack_execute flag.  In main() in
+  ld.c in the second loop over the argv[] to pick up the object files was
+  missing a test for "allow_stack_execute" and it was incorrectly thinking it
+  had an argument.  Radar bug #4571206.
+
+Changes for the 5.23 release (the cctools-617 release):
+- Changed pass1_archive() in pass1.c to no longer check the timestamp of the
+  archive against the table of contents archive member.  Radar bug #4462449.
+
+Changes for the 5.23 release (the cctools-613 release):
+- Changed layout.c to add macros that rename structure members of the 
+  ppc and i386 thread states for Unix conformance.  Radar bug #4508798.
+
+Changes for the 5.22 release picked up from cctools-590.42 (the cctools-610
+release):
+- Fixed another bug in the handling of the -Y undefined symbol tracing.  This 
+  is more fall out of Radar bug #3737622.  Where the code was changed when
+  linking two-level, to not search libraries that can't be encode as ordinals.  
+  The code just inside the outer loop needed to have one of its checks changed
+  so that it ignores any object with cur_obj->dylib set to TRUE no matter if the
+  if is for a module linked from a dylib or not (cur_obj->dylib_module != NULL).
+  Radar bug #4521358.
+
+Changes for the 5.22 release (the cctools-590.40.1 release):
+- Ignore multiple -syslibroot flags if they specify the same argument. Radar
+  bug #4354876.
+
+Changes for the 5.22 release (the cctools-590.31.1 release):
+- Changed to invoke ld64 without any extra arguments when given a 64-bit
+  object file.
+
+Changes for the 5.21 release (the cctools-590.41 release):
+- Fixed problems with the handling of the ___dso_handle linker defined symbol
+  when it appears in an object used with -bundle_loader.  It needs to not cause
+  an error when it only appears in the -bundle_loader file and still only be
+  defined in the output file when it is referenced by the linked objects.  To
+  handle the case when it appears in the -bundle_loader file but is not
+  referenced by the objects, a test was added for this special case in
+  setup_link_editor_symbol() in symbols.c to treat it like the symbol was not
+  present.  Then to handle the case when the symbol is referenced an additional
+  condition was added to the error check in define_link_editor_symbol() in
+  symbols.c to not cause the error if the symbol was defined in the
+  -bundle_loader file and also move the return from the function for that case
+  to only happen when the error happens.  Radar bug #4482300.
+
+Changes for the 5.21 release (the cctools-590.39 release):
+- Removed the -I flag for private headers as it would no longer compile with it.
+- Fixed a bug in the handling of the -Y undefined symbol tracing.  This appears
+  to be more fall out of Radar bug #3737622.  Where the code was changed when
+  linking two-level, to not search libraries that can't be encode as ordinals.  
+  The fix done is safe, in that merged_symbols with twolevel_reference field set
+  to TRUE are not ever to be traced with the -Y option.  So an extra test was
+  added to the loop for -Y symbol tracing in process_undefineds() in symbols.c .
+  Radar bug #4495010.
+
+Changes for the 5.21 release (the cctools-590.38 release):
+- Don't warn about an empty debug_info section.  The change was in
+  read_dwarf_info() in pass1.c to add the extra condtional
+  "debug_info->size == 0" to the if statement with the comment "No DWARF means
+  nothing to do".  Radar bug #4492686.
+- Fixed a bug that caused the "internal error: output_local_symbols()
+  inconsistent local symbol count" when there were multiply defined symbols and
+  the -m flag was used.  The fix was to add a new local boolean variable,
+  discarded_multiply_defined_symbol, to merged_symbols() in symbols.c that gets
+  set to FALSE at the start of merging each symbol and gets set to TRUE if the
+  symbol is multiply defined.  Then in the if conditional before
+  count_dwarf_symbols() is called the additional test of
+  ! discarded_multiply_defined_symbol was added.  Radar bug #4487503.
+- Fixed a bug that caused the "internal error: output_local_symbols()'
+  inconsistent local symbol count" when converting common to undefined in an
+  object compiled with DWARF.  The fix was to move the call to
+  maybe_remove_dwarf_symbol() in merge_dylib_module_symbols() in symbols.c 
+  right after the label use_symbol_definition_from_this_dylib.  This call needs
+  to be made BEFORE a merged_symbol has its definition_object changed to the
+  cur_obj.  The same change was also done in merge_bundle_loader_symbols()
+  in symbols.c .  Radar bug #4446605.
+- Changed the handling of symbols names listed in the -unexported_symbols_list
+  file and now no longer check to see of they are seen in the linked objects.
+  The change is in main() in ld.c and is just the removal of the loop of code
+  that checks the remove_symbols[] array for seen symbols.  Radar bug #4465511.
+- Changed the handling of the -Y flag to not cause an error when multiple -Y
+  flags are specified.  When multiple -Y flags are specified the last one is
+  used.  The change is in main() in ld.c and is just the removal of the test
+  for Yflag != 0 and the error message.  Radar bug #4461031.
+
+Changes for the 5.21 release (the cctools-590.37 release):
+- Fixed a problem with causing the link editor defined symbol ___dso_handle to
+  be made into a private extern with the -exported_symbols_list or
+  -unexported_symbols_list options.  The code in define_link_editor_symbol() in
+  symbols.c around the call to exports_list_processing() needed to adjust
+  the private extern symbols count if the symbol was made into a private extern.
+  And not be called at all if the symbol started out as a private extern.
+  Radar bug #4461173.
+- Fixed problems with -dead_strip removing sections with contents created from
+  files.  Radar bug #4439885.
+  - In layout_ordered_sections() in sections.c the loop that looks for merged
+    sections with order files or when -dead_strip is specified had an expression
+    added to the if() to skip certian sections.  If the section was created from
+    a file it is also skipped so that layout_ordered_section() is not called
+    which was zeroing out the section size.
+  - In resize_live_sections() in sections.c the loop that looks for S_REGULAR
+    section types was changed.  An extra condition was added to the if()
+    expression so it would not call resize_live_section() when the section was
+    created from a file.
+  - In flush_scatter_copied_sections() in sections.c the if() test for calling
+    sections with order files or when dead code stripping was specified was
+    changed.  A test was added when the section was created from a file so
+    output_flush() in not called in this case.
+  - Added setting S_ATTR_NO_DEAD_STRIP in process_section_specs() in spec.c for
+    sections created from files.  
+
 Changes for the 5.21 release (the cctools-590.36 release):
 - Changed the link editor defined symbol from __dso_handle to ___dso_handle.
   Radar bug #3992244.

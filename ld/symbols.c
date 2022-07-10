@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1999-2006 Apple Computer, Inc.  All Rights Reserved.
+ * Copyright (c) 1999-2007 Apple Computer, Inc.  All Rights Reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  *
@@ -948,6 +948,7 @@ merge_symbols(void)
     char *object_strings;
     struct merged_symbol *hash_pointer, *merged_symbol;
     enum bool discarded_coalesced_symbol;
+    enum bool discarded_multiply_defined_symbol;
     unsigned short n_desc;
     size_t * debug_ptr;
 
@@ -1171,6 +1172,7 @@ merge_symbols(void)
 	debug_ptr = cur_obj->dwarf_source_data;
 	for(i = 0; i < cur_obj->symtab->nsyms; i++){
 	    discarded_coalesced_symbol = FALSE;
+	    discarded_multiply_defined_symbol = FALSE;
 	    if (debug_ptr && *debug_ptr < i) {
 	      for (debug_ptr += 2; *debug_ptr & 0x80000000; debug_ptr++) ;
 	    }
@@ -1255,6 +1257,16 @@ merge_symbols(void)
 			 */
 			merged_symbol->nlist.n_desc |=
 			   (object_symbols[i].n_desc & REFERENCED_DYNAMICALLY);
+
+			/*
+			 * This is part of the cctools_aek-thumb-hack branch.
+			 * It seems to think undefined symbols would be marked
+			 * as symbols that are definitions of Thumb symbols.
+			 * But since undefined symbols are not definitions I
+			 * don't see how this code would ever be used.
+			merged_symbol->nlist.n_desc |=
+			   (object_symbols[i].n_desc & N_ARM_THUMB_DEF);
+			 */
 
 			/*
 			 * If the merged symbol is also an undefined deal with
@@ -1381,6 +1393,12 @@ merge_symbols(void)
 			n_desc |= (merged_symbol->nlist.n_desc &
 				   REFERENCED_DYNAMICALLY);
 			/*
+			 * If the object symbol is a symbol defined as Thumb
+			 * symbol then keep this information.
+			 */
+			n_desc |= (object_symbols[i].n_desc & N_ARM_THUMB_DEF);
+
+			/*
 			 * If the object symbol is a weak definition it may be
 			 * later discarded for a non-weak symbol from a dylib so
 			 * if the undefined symbol is a weak reference keep that
@@ -1492,10 +1510,32 @@ merge_symbols(void)
 			   REFERENCED_DYNAMICALLY)
 			    merged_symbol->nlist.n_desc =
 				object_symbols[i].n_desc |
-				REFERENCED_DYNAMICALLY;
+				REFERENCED_DYNAMICALLY
+				/*
+				 * This was part of the cctools_aek-thumb-hack
+				 * branch.  It seems to think if the discarded
+				 * weak merged symbol was marked as Thumb
+				 * definition then that should be preserved.
+				 * But since the object symbol is being used
+				 * instead it may not be a Thumb definition.
+				| (merged_symbol->nlist.n_desc &
+				   N_ARM_THUMB_DEF)
+				*/
+				;
 			else
 			    merged_symbol->nlist.n_desc =
-				object_symbols[i].n_desc;
+				object_symbols[i].n_desc
+				/*
+				 * This was part of the cctools_aek-thumb-hack
+				 * branch.  It seems to think if the discarded
+				 * weak merged symbol was marked as Thumb
+				 * definition then that should be preserved.
+				 * But since the object symbol is being used
+				 * instead it may not be a Thumb definition.
+				| (merged_symbol->nlist.n_desc &
+				   N_ARM_THUMB_DEF)
+				*/
+				;
 			if(merged_symbol->nlist.n_type == (N_EXT | N_INDR))
 			    enter_indr_symbol(merged_symbol,
 					      &(object_symbols[i]),
@@ -1554,6 +1594,7 @@ printf("symbol: %s is coalesced\n", merged_symbol->nlist.n_un.n_name);
                   }
 #endif /* KLD */
 		    else{
+			discarded_multiply_defined_symbol = TRUE;
 			multiply_defined(merged_symbol, &(object_symbols[i]),
 					 object_strings);
 			if(allow_multiply_defined_symbols == TRUE){
@@ -1652,7 +1693,8 @@ printf("symbol: %s is coalesced\n", merged_symbol->nlist.n_un.n_name);
 
 	    /* If this file had DWARF, account for the extra debug_map
 	       symbols.  */
-	    if (cur_obj->dwarf_name && ! discarded_coalesced_symbol){
+	    if (cur_obj->dwarf_name && ! discarded_coalesced_symbol &&
+		! discarded_multiply_defined_symbol){
 	      size_t n = count_dwarf_symbols (object_symbols + i, i,
 					      debug_ptr);
 	      cur_obj->nlocalsym += n;
@@ -2423,7 +2465,6 @@ struct dynamic_library *dynamic_library)
 			else{
 			    merged_symbol->definition_object->nextdefsym--;
 			}
-			maybe_remove_dwarf_symbol (merged_symbol);
 		    }
 		    /*
 		     * If the output file is a multi module MH_DYLIB type reset
@@ -2563,6 +2604,7 @@ struct dynamic_library *dynamic_library)
 		}
 	    }
 use_symbol_definition_from_this_dylib:
+	    maybe_remove_dwarf_symbol(merged_symbol);
 	    merged_symbol->nlist.n_type = N_PBUD | N_EXT;
 	    merged_symbol->nlist.n_sect = NO_SECT;
 	    if((symbols[j].n_type & N_TYPE) == N_SECT &&
@@ -2603,6 +2645,8 @@ printf("merging in coalesced symbol %s\n", merged_symbol->nlist.n_un.n_name);
 	     * contains the reference type (lazy or non-lazy).
 	     */
 	    merged_symbol->nlist.n_value = symbols[j].n_value;
+	    if(symbols[j].n_desc & N_ARM_THUMB_DEF)
+		merged_symbol->nlist.n_value |= 1;
 	    merged_symbol->definition_object = cur_obj;
 	    merged_symbol->defined_in_dylib = TRUE;
 	    merged_symbol->definition_library = dynamic_library;
@@ -2978,7 +3022,6 @@ struct dynamic_library *dynamic_library)
 			else{
 			    merged_symbol->definition_object->nextdefsym--;
 			}
-			maybe_remove_dwarf_symbol (merged_symbol);
 		    }
 		    /*
 		     * If the output file is a multi module MH_DYLIB type reset
@@ -3112,6 +3155,7 @@ struct dynamic_library *dynamic_library)
 		}
 	    }
 use_symbol_definition_from_this_bundle_loader:
+	    maybe_remove_dwarf_symbol(merged_symbol);
 	    merged_symbol->nlist.n_type = N_PBUD | N_EXT;
 	    merged_symbol->nlist.n_sect = NO_SECT;
 	    if((symbols[j].n_type & N_TYPE) == N_SECT &&
@@ -5102,6 +5146,18 @@ char *symbol_name)
 	/* if it is not present just return */
 	if(merged_symbol->name_len == 0)
 	    return;
+	/*
+	 * For MH_BUNDLE files we need to special case the handling of the
+	 * link editor defined symbol ___dso_handle since it is allowed to
+	 * be defined in the -bundle_loader file.  But it may not referenced
+	 * from any of the the objects being linked.  In this case we treat it
+	 * like the symbol is not present and just return.
+	 */
+	if(filetype == MH_BUNDLE &&
+	   strcmp(symbol_name, "___dso_handle") == 0 &&
+	   merged_symbol->definition_object->bundle_loader == TRUE &&
+	   merged_symbol->non_dylib_referenced_obj == NULL)
+	    return;
 
 	/*
 	 * For MH_EXECUTE file types the symbol is always absolute so just
@@ -5425,17 +5481,19 @@ unsigned long value)
 	    return;
 	/*
 	 * The symbol is present and must be undefined unless it is defined
-	 * in the base file of an incremental link.
+	 * in the base file of an incremental link or in the -bundle_loader
+	 * file (for the case of the ___dso_handle symbol).
 	 */
 	if((merged_symbol->nlist.n_type & N_EXT) != N_EXT ||
 	   (merged_symbol->nlist.n_type & N_TYPE) != N_UNDF ||
 	   merged_symbol->nlist.n_value != 0){
-	    if(merged_symbol->definition_object != base_obj){
+	    if(merged_symbol->definition_object != base_obj &&
+	       merged_symbol->definition_object->bundle_loader == FALSE){
 		error("loaded objects attempt to redefine link editor "
 		      "defined symbol %s", symbol_name);
 		trace_merged_symbol(merged_symbol);
+		return;
 	    }
-	    return;
 	}
 
 	/*
@@ -5455,12 +5513,26 @@ unsigned long value)
 
 #ifndef RLD
 	/*
-	 * If we have an -export_symbols_list or
-	 * -unexport_symbol_list option set the private extern bit
-	 * on the symbol if it is not to be exported.
+	 * If this symbol is already a private extern then it does not get
+	 * processed with the export lists.
 	 */
-	exports_list_processing(merged_symbol->nlist.n_un.n_name,
-				&(merged_symbol->nlist));
+	if((merged_symbol->nlist.n_type & N_PEXT) != N_PEXT){
+	    /*
+	     * If we have an -export_symbols_list or
+	     * -unexport_symbol_list option set the private extern bit
+	     * on the symbol if it is not to be exported.
+	     */
+	    exports_list_processing(merged_symbol->nlist.n_un.n_name,
+				    &(merged_symbol->nlist));
+	    /*
+	     * If this symbol got made into a private extern with the processing
+	     * of the exports list increment the count of private exterals.
+	     */
+	    if((merged_symbol->nlist.n_type & N_PEXT) == N_PEXT){
+		merged_symbol->definition_object->nprivatesym++;
+		nmerged_private_symbols++;
+	    }
+	}
 #endif
 
 	/*
@@ -6861,8 +6933,9 @@ output_merged_symbols(void)
 			continue;
 #endif /* RLD */
 		    if(strip_level == STRIP_DYNAMIC_EXECUTABLE &&
-		       (merged_symbol->nlist.n_desc & REFERENCED_DYNAMICALLY) !=
-			REFERENCED_DYNAMICALLY)
+		       (((merged_symbol->nlist.n_desc &
+			  REFERENCED_DYNAMICALLY) != REFERENCED_DYNAMICALLY) ||
+			 (merged_symbol->nlist.n_type & N_PEXT) == N_PEXT))
 			continue;
 		    if(dead_strip == TRUE && merged_symbol->live == FALSE)
 			continue;
@@ -7364,7 +7437,7 @@ void)
 	 * does not support them generate a warning can clear the weak reference
 	 * bit.
 	 */
-	if(macosx_deployment_target <= MACOSX_DEPLOYMENT_TARGET_10_1){
+	if(macosx_deployment_target.major <= 1){
 	    weak_ref_warning = FALSE;
 	    for(merged_symbol_list = merged_symbol_root == NULL ? NULL :
 				     merged_symbol_root->list;
@@ -7381,7 +7454,7 @@ void)
 			    warning("weak symbol references not set in output "
 				    "with MACOSX_DEPLOYMENT_TARGET environment "
 				    "variable set to: %s",
-				    macosx_deployment_target_name);
+				    macosx_deployment_target.name);
 			    warning("weak referenced symbols:");
 			    weak_ref_warning = TRUE;
 			}
@@ -7561,7 +7634,7 @@ void)
 		object_list = *q;
 		for(i = 0; i < object_list->used; i++){
 		    cur_obj = &(object_list->object_files[i]);
-		    if(cur_obj->dylib && cur_obj->dylib_module == NULL)
+		    if(cur_obj->dylib)
 			continue;
 		    if(cur_obj->bundle_loader)
 			continue;
@@ -7570,7 +7643,8 @@ void)
 		    for(j = 0; j < cur_obj->nundefineds; j++){
 			merged_symbol =
 			    cur_obj->undefined_maps[j].merged_symbol;
-			if(merged_symbol == NULL)
+			if(merged_symbol == NULL ||
+			   merged_symbol->twolevel_reference == TRUE)
 			    continue;
 			if(merged_symbol->nlist.n_type == (N_EXT|N_UNDF) &&
 			   merged_symbol->nlist.n_value == 0){

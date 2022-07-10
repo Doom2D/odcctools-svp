@@ -80,9 +80,32 @@
 #ifndef	_MACH_MACHINE_H_
 #define _MACH_MACHINE_H_
 
+#import <mach/machine/vm_types.h>
+#import <mach/boolean.h>
+
+/*
+ *	For each host, there is a maximum possible number of
+ *	cpus that may be available in the system.  This is the
+ *	compile-time constant NCPUS, which is defined in cpus.h.
+ *
+ *	In addition, there is a machine_slot specifier for each
+ *	possible cpu in the system.
+ */
+
+struct machine_info {
+	int		major_version;	/* kernel major version id */
+	int		minor_version;	/* kernel minor version id */
+	int		max_cpus;	/* max number of cpus compiled */
+	int		avail_cpus;	/* number actually available */
+	vm_size_t	memory_size;	/* size of memory in bytes */
+};
+
+typedef struct machine_info	*machine_info_t;
+typedef struct machine_info	machine_info_data_t;	/* bogus */
+
 typedef int	cpu_type_t;
 typedef int	cpu_subtype_t;
-typedef int	cpu_threadtype_t;
+typedef integer_t	cpu_threadtype_t;
 
 #define CPU_STATE_MAX		3
 
@@ -90,6 +113,24 @@ typedef int	cpu_threadtype_t;
 #define CPU_STATE_SYSTEM	1
 #define CPU_STATE_IDLE		2
 
+struct machine_slot {
+	boolean_t	is_cpu;		/* is there a cpu in this slot? */
+	cpu_type_t	cpu_type;	/* type of cpu */
+	cpu_subtype_t	cpu_subtype;	/* subtype of cpu */
+	volatile boolean_t running;	/* is cpu running */
+	long		cpu_ticks[CPU_STATE_MAX];
+	int		clock_freq;	/* clock interrupt frequency */
+};
+
+typedef struct machine_slot	*machine_slot_t;
+typedef struct machine_slot	machine_slot_data_t;	/* bogus */
+
+#ifdef	KERNEL
+extern struct machine_info	machine_info;
+extern struct machine_slot	machine_slot[];
+
+extern vm_offset_t		interrupt_stack[];
+#endif	/* KERNEL */
 
 /*
  *	Machine types known by all.
@@ -103,6 +144,7 @@ typedef int	cpu_threadtype_t;
 #define CPU_TYPE_NS32332        ((cpu_type_t) 5)
 #define	CPU_TYPE_MC680x0	((cpu_type_t) 6)
 #define CPU_TYPE_I386		((cpu_type_t) 7)
+#define CPU_TYPE_X86_64		((cpu_type_t) (CPU_TYPE_I386 | CPU_ARCH_ABI64))
 #define CPU_TYPE_MIPS		((cpu_type_t) 8)
 #define CPU_TYPE_NS32532        ((cpu_type_t) 9)
 #define CPU_TYPE_HPPA           ((cpu_type_t) 11)
@@ -124,6 +166,13 @@ typedef int	cpu_threadtype_t;
  *	dependent directory, so that any program can get all definitions
  *	regardless of where is it compiled).
  */
+
+/*
+ * Capability bits used in the definition of cpu_subtype.
+ */
+#define CPU_SUBTYPE_MASK       0xff000000      /* mask for feature flags */
+#define CPU_SUBTYPE_LIB64      0x80000000      /* 64 bit libraries */
+
 
 /*
  *	Object files that are hand-crafted to run on any
@@ -183,6 +232,7 @@ typedef int	cpu_threadtype_t;
  */
 
 #define	CPU_SUBTYPE_I386_ALL	((cpu_subtype_t) 3)
+#define	CPU_SUBTYPE_X86_64_ALL	CPU_SUBTYPE_I386_ALL
 #define CPU_SUBTYPE_386		((cpu_subtype_t) 3)
 #define CPU_SUBTYPE_486		((cpu_subtype_t) 4)
 #define CPU_SUBTYPE_486SX	((cpu_subtype_t) 4 + 128)
@@ -252,7 +302,10 @@ typedef int	cpu_threadtype_t;
 #define CPU_SUBTYPE_ARM_A500		((cpu_subtype_t) 2)
 #define CPU_SUBTYPE_ARM_A440		((cpu_subtype_t) 3)
 #define CPU_SUBTYPE_ARM_M4		((cpu_subtype_t) 4)
-#define CPU_SUBTYPE_ARM_A680		((cpu_subtype_t) 5)
+#define CPU_SUBTYPE_ARM_V4T		((cpu_subtype_t) 5)
+#define CPU_SUBTYPE_ARM_V6		((cpu_subtype_t) 6)
+#define CPU_SUBTYPE_ARM_V5TEJ		((cpu_subtype_t) 7)
+#define CPU_SUBTYPE_ARM_XSCALE		((cpu_subtype_t) 8)
 
 /*
  *	MC88000 subtypes
@@ -326,6 +379,8 @@ typedef int	cpu_threadtype_t;
  */
 #define CPU_SUBTYPE_VEO_1	((cpu_subtype_t) 1)
 #define CPU_SUBTYPE_VEO_2	((cpu_subtype_t) 2)
+#define CPU_SUBTYPE_VEO_3	((cpu_subtype_t) 3)
+#define CPU_SUBTYPE_VEO_4	((cpu_subtype_t) 4)
 #define CPU_SUBTYPE_VEO_ALL	CPU_SUBTYPE_VEO_2
 
 #endif	/* _MACH_MACHINE_H_ */

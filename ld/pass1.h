@@ -63,8 +63,6 @@ extern char *standard_framework_dirs[];
 /* the pointer to the head of the base object file's segments */
 extern struct merged_segment *base_obj_segments;
 
-extern char *search_lib_extensions[];
-
 /*
  * These are pointers to strings and symbols used to search of the table of
  * contents of a library.  These have to be can not be local so that routines

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2003 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 1999-2003 Apple Computer, Inc.  All Rights Reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  * 
@@ -20,16 +20,20 @@
  * 
  * @APPLE_LICENSE_HEADER_END@
  */
-#include <mach/mach.h>
+#if defined(__MWERKS__) && !defined(__private_extern__)
+#define __private_extern__ __declspec(private_extern)
+#endif
 
-struct macosx_deployment_target {
-    unsigned long major;	/* major version */
-    unsigned long minor;	/* minor version (if any or zero) */
-    char *name;			/* name for printing */
-};
-
-__private_extern__ void get_macosx_deployment_target(
-    struct macosx_deployment_target *value);
-
-__private_extern__ void put_macosx_deployment_target(
-    char *target);
+/*
+ * Global types, variables and routines declared in the file arm_reloc.c.
+ *
+ * The following include file need to be included before this file:
+ * #include <reloc.h>
+ * #include "section.h"
+ */
+extern void arm_reloc(
+    char *contents,
+    struct relocation_info *relocs,
+    struct section_map *section_map,
+    struct live_refs *refs,
+    unsigned long reloc_index);

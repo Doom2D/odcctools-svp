@@ -215,6 +215,10 @@ extern enum bool is_merged_symbol_coalesced(
 extern int qsort_load_order_values(
     const struct load_order *load_order1,
     const struct load_order *load_order2);
+extern unsigned long align_to_input_mod(
+    unsigned long output_offset,
+    unsigned long input_offset,
+    unsigned long align);
 #ifdef RLD
 extern void reset_merged_sections(
     void);

@@ -113,13 +113,17 @@ static enum bool Aflag_specified = FALSE;
  */
 __private_extern__ struct arch_flag arch_flag =
 #if defined(KLD) && defined(__STATIC__)
+
 #ifdef __ppc__
     { "ppc",    CPU_TYPE_POWERPC, CPU_SUBTYPE_POWERPC_ALL };
 #elif __i386__
     { "i386",   CPU_TYPE_I386,    CPU_SUBTYPE_I386_ALL };
-#elif
+#elif __arm__
+    { "arm",	CPU_TYPE_ARM,     CPU_SUBTYPE_ARM_ALL };
+#else
 #error "unsupported architecture for static KLD"
 #endif
+
 #else /* !(defined(KLD) && defined(__STATIC__)) */
     { 0 };
 #endif /* defined(KLD) && defined(__STATIC__) */
@@ -271,9 +275,8 @@ __private_extern__ enum weak_reference_mismatches_handling
     weak_reference_mismatches = WEAK_REFS_MISMATCH_ERROR;
 
 /* The Mac OS X deployment target */
-__private_extern__ enum macosx_deployment_target_value
-	macosx_deployment_target = 0;
-__private_extern__ const char *macosx_deployment_target_name = NULL;
+__private_extern__ struct macosx_deployment_target
+	macosx_deployment_target = { 0 };
 
 /* The prebinding optimization */
 #ifndef RLD
@@ -544,22 +547,6 @@ char *envp[])
 	/* If ProjectBuilder is around set up for it */
 	check_for_ProjectBuilder();
 
-	/*
-	 * Temporary hack to recognize a "-arch ppc64" in the command
-	 * line and invoke ld64 instead, passing all the arguments
-	 * verbatim.
-	 */
-	for(i = 1 ; i < argc ; i++){
-	    if(*argv[i] == '-' &&
-	       argv[i][1] == 'a' &&
-	       strcmp(argv[i], "-arch") == 0 &&
-	       i + 1 < argc &&
-	       strcmp(argv[i+1], "ppc64") == 0){
-		argv[0] = BINDIR "/" LD64PROG;
-		ld_exit(!execute(argv, 0));
-	    }
-	}
-
 	/* This needs to be here so that we test the environment variable before
 	   the rest of options parsing.  */
 	if (getenv("LD_PRINT_OPTIONS") != NULL)
@@ -583,9 +570,6 @@ char *envp[])
 
 	        p = &(argv[i][1]);
 		switch(*p){
-		case 'B': 
-			if(strcmp(p, "Bstatic") && strcmp(p, "Bdynamic")) goto unknown_flag;
-			break;
 		case 'l':
 		    if(p[1] == '\0')
 			fatal("-l: argument missing");
@@ -813,16 +797,12 @@ char *envp[])
 		    else if(strcmp(p, "dylib_install_name") == 0){
 			if(i + 1 >= argc)
 			    fatal("-dylib_install_name: argument missing");
-			if(dylib_install_name != NULL)
-			    fatal("-dylib_install_name multiply specified");
 			dylib_install_name = argv[i + 1];
 			i += 1;
 		    }
-		    else if(strcmp(p, "dylib_current_version") == 0){
+  		    else if(strcmp(p, "dylib_current_version") == 0){
 			if(i + 1 >= argc)
 			    fatal("-dylib_current_version: argument missing");
-			if(dylib_current_version != 0)
-			    fatal("-dylib_current_version multiply specified");
 			if(get_version_number("-dylib_current_version",
 			    argv[i+1], &dylib_current_version) == FALSE)
 			    cleanup();
@@ -835,9 +815,6 @@ char *envp[])
 			if(i + 1 >= argc)
 			    fatal("-dylib_compatibility_version: argument "
 				  "missing");
-			if(dylib_compatibility_version != 0)
-			    fatal("-dylib_compatibility_version multiply "
-				  "specified");
 			if(get_version_number("-dylib_compatibility_version",
 			    argv[i+1], &dylib_compatibility_version) == FALSE)
 			    cleanup();
@@ -936,6 +913,10 @@ char *envp[])
 		    }
 		    else if(strcmp(p, "no_uuid") == 0){
 			 output_uuid_info.suppress = TRUE;
+		    }
+		    else if(strcmp(p, "noall_load") == 0){
+		      /* Ignore the flag.  */
+		      ;
 		    }
 		    else
 			goto unknown_flag;
@@ -1373,7 +1354,7 @@ char *envp[])
 		    else if(strcmp(p, "syslibroot") == 0){
 			if(i + 1 >= argc)
 			    fatal("%s: argument missing", argv[i]);
-			if(syslibroot_specified == TRUE)
+			if(syslibroot_specified == TRUE && strcmp(next_root, argv[i+1]) != 0)
 			    fatal("%s: multiply specified", argv[i]);
 			next_root = argv[i+1];
 			syslibroot_specified = TRUE;
@@ -1444,6 +1425,10 @@ char *envp[])
 				  "-arch %s", argv[i]);
 			    fatal("Usage: %s [options] file [...]", progname);
 			}
+			/* Default to -single_module on ARM. */
+			if(arch_flag.cputype == CPU_TYPE_ARM){
+			    multi_module_dylib = FALSE;
+			}
 			target_byte_sex = get_byte_sex_from_flag(&arch_flag);
 		    }
 		    /* specify an allowable client of this subframework
@@ -1473,6 +1458,31 @@ char *envp[])
 			i += 1;
 			break;
 		    }
+		    else if(strcmp(p, "compatibility_version") == 0){
+		        if(i + 1 >= argc)
+			    fatal("-compatibility_version: argument "
+				  "missing");
+			if(get_version_number("-compatibility_version",
+			    argv[i+1], &dylib_compatibility_version) == FALSE)
+			    cleanup();
+			if(dylib_compatibility_version == 0)
+			    fatal("-compatibility_version must be "
+				  "greater than zero");
+			i += 1;
+			break;
+		    }
+		    else if(strcmp(p, "current_version") == 0){
+		        if(i + 1 >= argc)
+			    fatal("-current_version: argument missing");
+			if(get_version_number("-current_version",
+			    argv[i+1], &dylib_current_version) == FALSE)
+			    cleanup();
+			if(dylib_current_version == 0)
+			    fatal("-current_version must be greater than "
+				  "zero");
+			i += 1;
+			break;
+		    }
 		    if(p[1] != '\0')
 			goto unknown_flag;
 		    break;
@@ -1499,6 +1509,12 @@ char *envp[])
 			if(++i >= argc)
 			    fatal("-init: argument missing");
 			init_name = argv[i];
+		    }
+		    else if(strcmp(p, "install_name") == 0){
+		        if(i + 1 >= argc)
+			    fatal("-install_name: argument missing");
+			dylib_install_name = argv[i + 1];
+			i += 1;
 		    }
 		    else{
 			/* create an indirect symbol, symbol_name, to be an
@@ -1783,8 +1799,6 @@ char *envp[])
 		    if(strcmp(p, "Y") == 0){
 			if(i + 1 >= argc)
 			    fatal("-Y: argument missing");
-			if(Yflag != 0)
-			    fatal("-Y: multiply specified");
 			Yflag = strtoul(argv[i+1], &endp, 10);
 			if(*endp != '\0')
 			    fatal("reference count for -Y %s not a proper "
@@ -1874,6 +1888,19 @@ char *envp[])
 unknown_flag:
 		    fatal("unknown flag: %s", argv[i]);
 		}
+	    }
+	}
+
+	/*
+	 * -sub_umbrella and -sub_library are not supported on ARM.
+	 * See <rdar://problem/4771657>.
+	 */
+	if(arch_flag.cputype == CPU_TYPE_ARM){
+	    if(sub_umbrellas != NULL){
+	        fatal("-sub_umbrella is not supported on ARM");
+	    }
+	    if(sub_librarys != NULL){
+	        fatal("-sub_library is not supported on ARM");
 	    }
 	}
 
@@ -2047,6 +2074,13 @@ unknown_flag:
 	 * the handling of the cpusubtypes.
 	 */
 	if(arch_flag.name != NULL){
+
+	    /*
+	     * 64-bit architectures are an error.
+	     */
+	    if(arch_flag.cputype & CPU_ARCH_ABI64)
+		fatal("does not support 64-bit architectures");
+
 	    family_arch_flag = get_arch_family_from_cputype(arch_flag.cputype);
 	    if(family_arch_flag == NULL)
 		fatal("internal error: unknown cputype (%d) for -arch %s (this "
@@ -2055,9 +2089,7 @@ unknown_flag:
 	    /*
 	     * Pick up the Mac OS X deployment target.
 	     */
-	    get_macosx_deployment_target(&macosx_deployment_target,
-					 &macosx_deployment_target_name,
-					 arch_flag.cputype);
+	    get_macosx_deployment_target(&macosx_deployment_target);
 	    /*
 	     * If for this cputype we are to always output the ALL cpusubtype
 	     * then set force_cpusubtype_ALL.
@@ -2097,9 +2129,8 @@ unknown_flag:
 	     * target architecture is not yet known so we can check to see if
 	     * the flags specified are valid.
 	     */
-	    get_macosx_deployment_target(&macosx_deployment_target,
-					 &macosx_deployment_target_name,
-					 CPU_TYPE_ANY);
+	    if(macosx_deployment_target.major == 0)
+		get_macosx_deployment_target(&macosx_deployment_target);
 	}
 
 	/*
@@ -2333,7 +2364,7 @@ unknown_flag:
 				seg_addr_table_entry->segs_read_write_addr;
 			if(segs_read_only_addr == 0 &&
 			   segs_read_write_addr == 0){
-			    segs_read_write_addr = 0x10000000;
+			    segs_read_write_addr = get_shared_region_size_from_flag(&arch_flag);
 			    warning("-segs_read_write_addr 0x0 ignored from "
 				    "segment address table: %s %s line %lu "
 				    "using -segs_read_write_addr 0x%x",
@@ -2452,15 +2483,24 @@ unknown_flag:
 	 * shared libraries. So if this is not a split library then turn off
 	 * prebinding.
 	 */
-	if(macosx_deployment_target >= MACOSX_DEPLOYMENT_TARGET_10_4){
+	if(macosx_deployment_target.major >= 4){
 	    if(filetype != MH_DYLIB){
-		if(prebinding_via_LD_PREBIND == FALSE &&
-		   prebinding_flag_specified == TRUE &&
-		   prebinding == TRUE){
-		    warning("-prebind ignored because MACOSX_DEPLOYMENT_TARGET "
-			    "environment variable greater or equal to 10.4");
+		/* 
+		 * If this is arm* or xscale, we want to prebind executables
+		 * too, not just dylibs and frameworks. 
+		 */
+		if (!((arch_flag.name != NULL) && 
+		      ((strncmp(arch_flag.name, "arm", 3) == 0) ||
+		       (strcmp(arch_flag.name, "xscale") == 0))))
+		{
+		    if(prebinding_via_LD_PREBIND == FALSE &&
+		       prebinding_flag_specified == TRUE &&
+		       prebinding == TRUE){
+			warning("-prebind ignored because MACOSX_DEPLOYMENT_TARGET "
+				"environment variable greater or equal to 10.4");
+		    }
+		    prebinding = FALSE;
 		}
-		prebinding = FALSE;
 	    }
 	    /*
 	     * This is an MH_DYLIB.  First see if it is on the list of libraries
@@ -2473,7 +2513,7 @@ unknown_flag:
 		 * If this library was not in the seg_addr_table see if it is
 		 * on the list of libraries not to be prebound. And if so turn
 		 * off prebinding.  Note this list is only ever used when
-		 * macosx_deployment_target >= MACOSX_DEPLOYMENT_TARGET_10_4 .
+		 * macosx_deployment_target.major >= 4 .
 		 */
 		if(seg_addr_table_entry == NULL &&
 		   unprebound_library(dylib_install_name,
@@ -2497,18 +2537,20 @@ unknown_flag:
 		     */
 		    if(seg_addr_table_entry == NULL &&
 		       getenv("LD_SPLITSEGS_NEW_LIBRARIES") != NULL){
+		    unsigned long arch_rw_addr = get_shared_region_size_from_flag(&arch_flag);
+
 			if(seg1addr_specified){
 			    warning("-seg1addr 0x%x ignored, using "
 				    "-segs_read_only_addr 0x%x and "
 				    "-segs_read_write_addr 0x%x because "
 				    "LD_SPLITSEGS_NEW_LIBRARIES environment is "
-				    "set",(unsigned int)seg1addr, 0,0x10000000);
+				    "set",(unsigned int)seg1addr, 0, arch_rw_addr);
 			}
 			seg1addr_specified = FALSE;
 			seg1addr = 0;
 			segs_read_only_addr_specified = TRUE;
 			segs_read_only_addr = 0;
-			segs_read_write_addr = 0x10000000;
+			segs_read_write_addr = arch_rw_addr;
 		    }
 		    /*
 		     * Finally if this is not a split library then turn off
@@ -2593,7 +2635,7 @@ unknown_flag:
 	   undefined_flag != UNDEFINED_ERROR &&
 	   undefined_flag != UNDEFINED_DYNAMIC_LOOKUP &&
 	   undefined_flag != UNDEFINED_DEFINE_A_WAY){
-	    if(macosx_deployment_target >=MACOSX_DEPLOYMENT_TARGET_10_3)
+	    if(macosx_deployment_target.major >= 3)
 		fatal("-undefined error, -undefined dynamic_lookup or "
 		      "-undefined define_a_way must be used when "
 		      "-twolevel_namespace is in effect");
@@ -2605,10 +2647,10 @@ unknown_flag:
 	    if(dynamic == FALSE)
 		fatal("incompatible flag -undefined dynamic_lookup used (must "
 		      "specify \"-dynamic\" to be used)");
-	    if(macosx_deployment_target < MACOSX_DEPLOYMENT_TARGET_10_3)
+	    if(macosx_deployment_target.major < 3)
 		fatal("flag: -undefined dynamic_lookup can't be used with "
 		      "MACOSX_DEPLOYMENT_TARGET environment variable set to: "
-		      "%s", macosx_deployment_target_name);
+		      "%s", macosx_deployment_target.name);
 	}
 	if(twolevel_namespace == TRUE && nundef_syms != 0){
 	    fatal("can't use -U flags when -twolevel_namespace is in effect");
@@ -2703,16 +2745,6 @@ unknown_flag:
 	    else{
 		p = &(argv[i][1]);
 		switch(*p){
-		case 'B':
-			if(strcmp(p, "Bstatic") == 0){
-				search_lib_extensions[0]=".a";
-				search_lib_extensions[1]=".dylib";
-				break;
-			} else if (strcmp(p, "Bdynamic") == 0){
-				search_lib_extensions[0]=".dylib";
-				search_lib_extensions[1]=".a";
-				break;
-			}
 		case 'b':
 		    if(strcmp(p, "bundle_loader") == 0){
 			/*
@@ -2821,6 +2853,10 @@ unknown_flag:
 			i++;
 			break;
 		    }
+		    else if(strcmp(p, "install_name") == 0){
+		        i++;
+			break;
+		    }
 		    /* create an indirect symbol, symbol_name, to be an indirect
 		       symbol for indr_symbol_name */
 		    symbol_name = p + 1;
@@ -2835,7 +2871,8 @@ unknown_flag:
 		case 'a':
 		    if(strcmp(p, "all_load") == 0 ||
 		       strcmp(p, "arch_multiple") == 0 ||
-		       strcmp(p, "arch_errors_fatal") == 0)
+		       strcmp(p, "arch_errors_fatal") == 0 ||
+		       strcmp(p, "allow_stack_execute") == 0)
 			break;
 		    i++;
 		    break;
@@ -2933,6 +2970,15 @@ unknown_flag:
 		    break;
 		}
 	    }
+	}
+
+ 	/*
+	 * If the architecture was not specified, and was inferred
+	 * from the object files, if it is a 64-bit architecture it is an error.
+	 */
+	if(arch_flag.cputype != 0 &&
+	    arch_flag.cputype & CPU_ARCH_ABI64){
+	    fatal("does not support 64-bit architectures");
 	}
 
 	/*
@@ -3042,20 +3088,6 @@ unknown_flag:
 			missing_syms = TRUE;
 		    }
 		    printf("%s\n", save_symbols[j].name);
-		}
-	    }
-	}
-	if(remove_symbols != NULL){
-	    missing_syms = FALSE;
-	    for(j = 0; j < nremove_symbols ; j++){
-		if(remove_symbols[j].seen == FALSE){
-		    if(missing_syms == FALSE){
-			error("symbols names listed in "
-			      "-unexported_symbols_list: %s not in linked "
-			      "objects", unexported_symbols_list);
-			missing_syms = TRUE;
-		    }
-		    printf("%s\n", remove_symbols[j].name);
 		}
 	    }
 	}

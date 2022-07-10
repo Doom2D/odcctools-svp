@@ -249,6 +249,14 @@ process_section_specs(void)
 			    ms->s.align = defaultsectalign;
 			ms->s.size = round(sect_spec->file_size,
 					   1 << ms->s.align);
+			/*
+			 * Sections created from files don't have symbols and
+			 * can't be referenced via a relocation entry.  So to
+			 * avoid having their contents removed when -dead_strip
+			 * is specified on later links we set this section
+			 * attribute.
+			 */
+			ms->s.flags |= S_ATTR_NO_DEAD_STRIP;
 		    }
 		    sect_spec->processed = TRUE;
 		    continue;
