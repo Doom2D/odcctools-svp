@@ -9,6 +9,7 @@ bindir		= @bindir@
 
 VPATH = @srcdir@:@srcdir@/Readers:@srcdir@/Writers
 
+CC              = @CC@
 CXX             = @CXX@
 CFLAGS          = @CFLAGS@ @CXXFLAGS@
 WARNINGS	= @WARNINGS@
@@ -44,12 +45,14 @@ MYCOMPILEFLAGS	= $(WARNINGS) $(MYWARNINGS) $(DEFS) $(MYDEFS) \
 
 MYLINKFLAGS	= $(LDFLAGS) $(MYLDFLAGS) $(MYLIBS)
 
-CXXFILES = ld.cpp Options.cpp SectCreate.cpp ObjectFileMachO-all.cpp \
-		ExecutableFileMachO-all.cpp 
+CFILES   = debugline.c
+CXXFILES = ld.cpp Options.cpp
 
-OBJS = $(CXXFILES:.cpp=.o) 
+OBJS = $(CXXFILES:.cpp=.o) $(CFILES:.c=.o)
 .cpp.o:
 	$(CXX) $(MYCOMPILEFLAGS) -c -o $@ $<
+.c.o:
+	$(CC) $(MYCOMPILEFLAGS) -c -o $@ $<
 
 .PHONY: default clean distclean install
 
