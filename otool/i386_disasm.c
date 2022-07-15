@@ -48,7 +48,6 @@ WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 */
 #include <stdio.h>
 #include <string.h>
-#include "stuff/target_arch.h"
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <mach-o/reloc.h>
@@ -56,15 +55,20 @@ WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 #include "stuff/bytesex.h"
 #include "otool.h"
 #include "ofile_print.h"
+#include "i386_disasm.h"
 
-#define MAX_MNEMONIC	9	/* Maximum number of chars per mnemonic */
+#define MAX_MNEMONIC	11	/* Maximum number of chars per mnemonic, plus a byte for '\0' */
 #define MAX_RESULT	14	/* Maximum number of char in a register */
 				/*  result expression "(%ebx,%ecx,8)" */
 
 #define WBIT(x)	(x & 0x1)		/* to get w bit	*/
 #define REGNO(x) (x & 0x7)		/* to get 3 bit register */
 #define VBIT(x)	((x)>>1 & 0x1)		/* to get 'v' bit */
-#define OPSIZE(data16,wbit) ((wbit) ? ((data16) ? 2:4) : 1 )
+#define OPSIZE(data16,wbit,maybe64) ((wbit) ? ((data16) ? 2: ((maybe64) ? 8 : 4)) : 1 )
+#define REX_W(x) (((x) & 0x8) == 0x8)	/* true if the REX.W bit is set --> 64-bit operand size */
+#define REX_R(x) (((x) & 0x4) == 0x4)	/* true if the REX.R bit is set --> ModRM reg extension */
+#define REX_X(x) (((x) & 0x2) == 0x2)	/* true if the REX.X bit is set --> SIB index extension */
+#define REX_B(x) (((x) & 0x1) == 0x1)	/* true if the REX.B bit is set --> ModRM r/m, SIB base, or opcode reg extension */
 
 #define REG_ONLY 3	/* mode indicates a single register with	*/
 			/* no displacement is an operand		*/
@@ -82,11 +86,23 @@ struct instable {
     char name[MAX_MNEMONIC];
     const struct instable *indirect;
     unsigned adr_mode;
-    int suffix;	/* for instructions which may have a 'w' or 'l' suffix */
+    int flags;
+    const struct instable *arch64;
 };
 #define	TERM	0	/* used to indicate that the 'indirect' field of the */
 			/* 'instable' terminates - no pointer.	*/
 #define	INVALID	{"",TERM,UNKNOWN,0}
+/*
+ * These are defined this way to make the initializations in the tables simpler
+ * and more readable for differences between 32-bit and 64-bit architectures.
+ */
+#define	INVALID_32 "",TERM,UNKNOWN,0
+static const struct instable op_invalid_64 = {"",TERM,/* UNKNOWN */0,0};
+#define INVALID_64 (&op_invalid_64)
+
+/* Flags */
+#define HAS_SUFFIX			0x1	/* For instructions which may have a 'w', 'l', or 'q' suffix */
+#define IS_POINTER_SIZED	0x2	/* For instructions which implicitly have operands which are sizeof(void *) */
 
 static void get_operand(
     const char **symadd,
@@ -94,6 +110,7 @@ static void get_operand(
     unsigned long *value,
     unsigned long *value_size,
     char *result,
+    const cpu_type_t cputype,
     const unsigned long mode,
     const unsigned long r_m,
     const unsigned long wbit,
@@ -101,6 +118,7 @@ static void get_operand(
     const enum bool addr16,
     const enum bool sse2,
     const enum bool mmx,
+	const unsigned int rex,
     const char *sect,
     unsigned long sect_addr,
     unsigned long *length,
@@ -108,7 +126,8 @@ static void get_operand(
     const unsigned long addr,
     const struct relocation_info *sorted_relocs,
     const unsigned long nsorted_relocs,
-    const nlist_t *symbols,
+    const struct nlist *symbols,
+    const struct nlist_64 *symbols64,
     const unsigned long nsymbols,
     const char *strings,
     const unsigned long strings_size,
@@ -119,16 +138,18 @@ static void get_operand(
 static void immediate(
     const char **symadd,
     const char **symsub,
-    unsigned long *value,
+    unsigned long long *value,
     unsigned long value_size,
     const char *sect,
     unsigned long sect_addr,
     unsigned long *length,
     unsigned long *left,
+    const cpu_type_t cputype,
     const unsigned long addr,
     const struct relocation_info *sorted_relocs,
     const unsigned long nsorted_relocs,
-    const nlist_t *symbols,
+    const struct nlist *symbols,
+    const struct nlist_64 *symbols64,
     const unsigned long nsymbols,
     const char *strings,
     const unsigned long strings_size,
@@ -142,13 +163,15 @@ static void displacement(
     unsigned long *value,
     const unsigned long value_size,
     const char *sect,
-    unsigned long sect_addr,
+    uint64_t sect_addr,
     unsigned long *length,
     unsigned long *left,
-    const unsigned long addr,
+    const cpu_type_t cputype,
+    const uint64_t addr,
     const struct relocation_info *sorted_relocs,
     const unsigned long nsorted_relocs,
-    const nlist_t *symbols,
+    const struct nlist *symbols,
+    const struct nlist_64 *symbols64,
     const unsigned long nsymbols,
     const char *strings,
     const unsigned long strings_size,
@@ -159,12 +182,14 @@ static void displacement(
 static void get_symbol(
     const char **symadd,
     const char **symsub,
-    unsigned long *offset,
+    unsigned long long *offset,
+    const cpu_type_t cputype,
     const unsigned long sect_offset,
-    const unsigned long value,
+    const unsigned long long value,
     const struct relocation_info *relocs,
     const unsigned long nrelocs,
-    const nlist_t *symbols,
+    const struct nlist *symbols,
+    const struct nlist_64 *symbols64,
     const unsigned long nsymbols,
     const char *strings,
     const unsigned long strings_size,
@@ -176,12 +201,12 @@ static void print_operand(
     const char *seg,
     const char *symadd,
     const char *symsub,
-    unsigned int value,
+    unsigned long long value,
     unsigned int value_size,
     const char *result,
     const char *tail);
 
-static unsigned long get_value(
+static unsigned long long get_value(
     const unsigned long size,
     const char *sect,
     unsigned long *length,
@@ -195,27 +220,28 @@ static void modrm_byte(
 
 #define GET_OPERAND(symadd, symsub, value, value_size, result) \
 	get_operand((symadd), (symsub), (value), (value_size), (result), \
-		    mode, r_m, wbit, data16, addr16, sse2, mmx, sect, \
-		    sect_addr, &length, &left, addr, sorted_relocs, \
-		    nsorted_relocs, symbols, nsymbols, strings, strings_size, \
-		    sorted_symbols, nsorted_symbols, verbose)
+		    cputype, mode, r_m, wbit, data16, addr16, sse2, mmx, rex, \
+		    sect, sect_addr, &length, &left, addr, sorted_relocs, \
+		    nsorted_relocs, symbols, symbols64, nsymbols, strings, \
+		    strings_size, sorted_symbols, nsorted_symbols, verbose)
 
 #define DISPLACEMENT(symadd, symsub, value, value_size) \
 	displacement((symadd), (symsub), (value), (value_size), sect, \
-		     sect_addr, &length, &left, addr, sorted_relocs, \
-		     nsorted_relocs, symbols, nsymbols, strings, strings_size, \
-		     sorted_symbols, nsorted_symbols, verbose)
+		     sect_addr, &length, &left, cputype, addr, sorted_relocs, \
+		     nsorted_relocs, symbols, symbols64, nsymbols, strings, \
+		     strings_size, sorted_symbols, nsorted_symbols, verbose)
 
 #define IMMEDIATE(symadd, symsub, value, value_size) \
 	immediate((symadd), (symsub), (value), (value_size), sect, sect_addr, \
-		  &length, &left, addr, sorted_relocs, nsorted_relocs, \
-		  symbols, nsymbols, strings, strings_size, sorted_symbols, \
-		  nsorted_symbols, verbose)
+		  &length, &left, cputype, addr, sorted_relocs, \
+		  nsorted_relocs, symbols, symbols64, nsymbols, strings, \
+		  strings_size, sorted_symbols, nsorted_symbols, verbose)
 
 #define GET_SYMBOL(symadd, symsub, offset, sect_offset, value) \
-	get_symbol((symadd), (symsub), (offset), (sect_offset), (value), \
-		    sorted_relocs, nsorted_relocs, symbols, nsymbols, strings,\
-		    strings_size, sorted_symbols, nsorted_symbols, verbose)
+	get_symbol((symadd), (symsub), (offset), cputype, (sect_offset), \
+		   (value), sorted_relocs, nsorted_relocs, symbols, symbols64, \
+		   nsymbols, strings, strings_size, sorted_symbols, \
+		   nsorted_symbols, verbose)
 
 #define GUESS_SYMBOL(value) \
 	guess_symbol((value), sorted_symbols, nsorted_symbols, verbose)
@@ -287,15 +313,26 @@ static void modrm_byte(
 #define Mb	60
 #define INMl	61
 #define SSE2	62	/* SSE2 instruction with possible 3rd opcode byte */
-#define SSE2i	63	/* SSE2 instruction with 8 bit immediate */
-#define SSE2i1	64	/* SSE2 with one operand and 8 bit immediate */
+#define SSE2i	63	/* SSE2 instruction with 8-bit immediate */
+#define SSE2i1	64	/* SSE2 with one operand and 8-bit immediate */
 #define SSE2tm	65	/* SSE2 with dest to memory */
 #define SSE2tfm	66	/* SSE2 with dest to memory or memory to dest */
 #define PFCH	67	/* prefetch instructions */
 #define SFEN	68	/* sfence & clflush */
-#define Mnol	69	/* no 'l' suffix, fildl & fistpl */
+#define Mnol	69	/* no 'l' suffix, fildl, fistpl */
 #define AMD3DNOW       70  /* 3DNow! instruction (SSE2 format with a suffix) */
 #define PFCH3DNOW      71  /* 3DNow! prefetch instruction */
+#define REX	72		/* 64-bit REX prefix */
+#define IR64 73		/* IR with a 64-bit immediate if REX.W is set */
+#define MNI 74		/* MNI instruction, differentiated by 2nd and 3rd opcode bytes */
+#define MNIi 75		/* MNI instruction with 8-bit immediate, differentiated by 2nd and 3rd opcode bytes */
+#define SSE4	76	/* SSE4 instruction with 3rd & 4th opcode bytes */
+#define SSE4i	77	/* SSE4 instruction with 8-bit immediate */
+#define SSE4itm	78	/* SSE4 with dest to memory and 8-bit immediate */
+#define SSE4ifm	79	/* SSE4 with src from memory and 8-bit immediate */
+#define SSE4MRw	80	/* SSE4.2 memory or register operand to register */
+#define SSE4CRC	81	/* SSE4.2 crc memory or register operand to register */
+#define SSE4CRCb	82	/* SSE4.2 crc byte memory or register operand to register */
 
 /*
  * In 16-bit addressing mode:
@@ -318,23 +355,31 @@ static const char * const REG16[8][2] = {
 };
 
 /*
- * In 32-bit addressing mode:
+ * In 32-bit or 64-bit addressing mode:
  * Register operands may be indicated by a distinguished field.
  * An '8' bit register is selected if the 'w' bit is equal to 0,
  * and a '32' bit register is selected if the 'w' bit is equal to
  * 1 and also if there is no 'w' bit.
  */
-static const char * const REG32[8][2] = {
-/* w bit		0		1		*/
+static const char * const REG32[16][3] = {
+/* w bit		0				1			1 + REX.W	*/
 /* reg bits */
-/* 000	*/		{"%al",		"%eax"},
-/* 001  */		{"%cl",		"%ecx"},
-/* 010  */		{"%dl",		"%edx"},
-/* 011	*/		{"%bl",		"%ebx"},
-/* 100	*/		{"%ah",		"%esp"},
-/* 101	*/		{"%ch",		"%ebp"},
-/* 110	*/		{"%dh",		"%esi"},
-/* 111	*/		{"%bh",		"%edi"}
+/* 0000	*/		{"%al",			"%eax",			"%rax"},
+/* 0001  */		{"%cl",			"%ecx",			"%rcx"},
+/* 0010  */		{"%dl",			"%edx",			"%rdx"},
+/* 0011	*/		{"%bl",			"%ebx",			"%rbx"},
+/* 0100	*/		{"%ah",			"%esp",			"%rsp"},
+/* 0101	*/		{"%ch",			"%ebp",			"%rbp"},
+/* 0110	*/		{"%dh",			"%esi",			"%rsi"},
+/* 0111	*/		{"%bh",			"%edi",			"%rdi"},
+/* 1000	*/		{"%r8b",		"%r8d",			"%r8"},
+/* 1001 */		{"%r9b",		"%r9d",			"%r9"},
+/* 1010 */		{"%r10b",		"%r10d",		"%r10"},
+/* 1011	*/		{"%r11b",		"%r11d",		"%r11"},
+/* 1100	*/		{"%r12b",		"%r12d",		"%r12"},
+/* 1101	*/		{"%r13b",		"%r13d",		"%r13"},
+/* 1110	*/		{"%r14b",		"%r14d",		"%r14"},
+/* 1111	*/		{"%r15b",		"%r15d",		"%r15"}
 };
 
 /*
@@ -392,12 +437,25 @@ static const char * const regname16[4][8] = {
  * and will also provide strings for printing.
  */
 static const char * const regname32[4][8] = {
-/*reg   000     001     010     011     100     101     110     111 */
+/*reg   000     001     010     011     100     101    110     111 */
 /*mod*/
 /*00 */{"%eax", "%ecx", "%edx", "%ebx", "%esp", "",     "%esi", "%edi"},
 /*01 */{"%eax", "%ecx", "%edx", "%ebx", "%esp", "%ebp", "%esi", "%edi"},
 /*10 */{"%eax", "%ecx", "%edx", "%ebx", "%esp", "%ebp", "%esi", "%edi"},
 /*11 */{"%eax", "%ecx", "%edx", "%ebx", "%esp", "%ebp", "%esi", "%edi"}
+};
+
+/*
+ * When data16 has not been specified, fields, to determine the addressing mode,
+ * and will also provide strings for printing.
+ */
+static const char * const regname64[4][16] = {
+/*reg   0000    0001    0010    0011    0100    0101    0110    0111    1000    1001    1010    1011    1100    1101    1110    1111 */
+/*mod*/
+/*00 */{"%rax", "%rcx", "%rdx", "%rbx", "%rsp", "%rbp", "%rsi", "%rdi", "%r8",  "%r9",  "%r10", "%r11", "%r12", "%r13", "%r14", "%r15"},
+/*01 */{"%rax", "%rcx", "%rdx", "%rbx", "%rsp", "%rbp", "%rsi", "%rdi", "%r8",  "%r9",  "%r10", "%r11", "%r12", "%r13", "%r14", "%r15"},
+/*10 */{"%rax", "%rcx", "%rdx", "%rbx", "%rsp", "%rbp", "%rsi", "%rdi", "%r8",  "%r9",  "%r10", "%r11", "%r12", "%r13", "%r14", "%r15"},
+/*11 */{"%rax", "%rcx", "%rdx", "%rbx", "%rsp", "%rbp", "%rsi", "%rdi", "%r8",  "%r9",  "%r10", "%r11", "%r12", "%r13", "%r14", "%r15"}
 };
 
 /*
@@ -421,6 +479,25 @@ static const char * const indexname[8] = {
     ",%edi"
 };
 
+static const char * const indexname64[16] = {
+    ",%rax",
+    ",%rcx",
+    ",%rdx",
+    ",%rbx",
+    "",
+    ",%rbp",
+    ",%rsi",
+    ",%rdi",
+	",%r8",
+	",%r9",
+	",%r10",
+	",%r11",
+	",%r12",
+	",%r13",
+	",%r14",
+	",%r15"
+};
+
 /*
  * Segment registers are selected by a two or three bit field.
  */
@@ -438,16 +515,18 @@ static const char * const SEGREG[8] = {
 /*
  * Special Registers
  */
-static const char * const DEBUGREG[8] = {
-    "%db0", "%db1", "%db2", "%db3", "%db4", "%db5", "%db6", "%db7"
+static const char * const DEBUGREG[] = {
+	"%db0", "%db1", "%db2", "%db3", "%db4", "%db5", "%db6", "%db7",
+	"%db8", "%db9", "%db10", "%db11", "%db12", "%db13", "%db14", "%db15"
 };
 
-static const char * const CONTROLREG[8] = {
-    "%cr0", "%cr1", "%cr2", "%cr3", "%cr4?", "%cr5?", "%cr6?", "%cr7?"
+static const char * const CONTROLREG[] = {
+	"%cr0", "%cr1", "%cr2", "%cr3", "%cr4", "%cr5", "%cr6", "%cr7",
+	"%cr8", "%cr9", "%cr10", "%cr11", "%cr12", "%cr13", "%cr14", "%cr15"
 };
 
 static const char * const TESTREG[8] = {
-    "%tr0?", "%tr1?", "%tr2?", "%tr3", "%tr4", "%tr5", "%tr6", "%tr7"
+    "%tr0", "%tr1", "%tr2", "%tr3", "%tr4", "%tr5", "%tr6", "%tr7"
 };
 
 /*
@@ -471,8 +550,211 @@ static const struct instable op0F01[8] = {
 		{"lmsw",TERM,M,1},	{"invlpg",TERM,M,1},
 };
 
+/*
+ * Decode table for 0x0F38 opcodes
+ */
+static const struct instable op0F38[256] = {
+/*  [00]  */	{"pshufb",TERM,MNI,0},	{"phaddw",TERM,MNI,0},
+		{"phaddd",TERM,MNI,0},	{"phaddsw",TERM,MNI,0},
+/*  [04]  */	{"pmaddubsw",TERM,MNI,0},	{"phsubw",TERM,MNI,0},
+		{"phsubd",TERM,MNI,0},	{"phsubsw",TERM,MNI,0},
+/*  [08]  */	{"psignb",TERM,MNI,0},	{"psignw",TERM,MNI,0},
+		{"psignd",TERM,MNI,0},	{"pmulhrsw",TERM,MNI,0},
+/*  [0C]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [10]  */	{"pblendvb",TERM,SSE4,0},	INVALID,
+		INVALID,	INVALID,
+/*  [14]  */	{"blendvps",TERM,SSE4,0},{"blendvpd",TERM,SSE4,0},
+		INVALID,	{"ptest",TERM,SSE4,0},
+/*  [18]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [1C]  */	{"pabsb",TERM,MNI,0},	{"pabsw",TERM,MNI,0},
+		{"pabsd",TERM,MNI,0},	INVALID,
+/*  [20]  */	{"pmovsxbw",TERM,SSE4,0},	{"pmovsxbd",TERM,SSE4,0},
+		{"pmovsxbq",TERM,SSE4,0},	{"pmovsxwd",TERM,SSE4,0},
+/*  [24]  */	{"pmovsxwq",TERM,SSE4,0},	{"pmovsxdq",TERM,SSE4,0},
+		INVALID,	INVALID,
+/*  [28]  */	{"pmuldq",TERM,SSE4,0},		{"pcmpeqq",TERM,SSE4,0},
+		{"movntdqa",TERM,SSE4,0},	{"packusdw",TERM,SSE4,0},
+/*  [2C]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [30]  */	{"pmovzxbw",TERM,SSE4,0},	{"pmovzxbd",TERM,SSE4,0},
+		{"pmovzxbq",TERM,SSE4,0},	{"pmovzxwd",TERM,SSE4,0},
+/*  [34]  */	{"pmovzxwq",TERM,SSE4,0},	{"pmovzxdq",TERM,SSE4,0},
+		INVALID,	{"pcmpgtq",TERM,SSE4,0},
+/*  [38]  */	{"pminsb",TERM,SSE4,0},	{"pminsd",TERM,SSE4,0},
+		{"pminuw",TERM,SSE4,0},	{"pminud",TERM,SSE4,0},
+/*  [3C]  */	{"pmaxsb",TERM,SSE4,0},	{"pmaxsd",TERM,SSE4,0},
+		{"pmaxuw",TERM,SSE4,0},	{"pmaxud",TERM,SSE4,0},
+/*  [40]  */	{"pmulld",TERM,SSE4,0},	{"phminposuw",TERM,SSE4,0},
+		INVALID,	INVALID,
+/*  [44]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [48]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [4C]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [50]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [54]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [58]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [5C]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [60]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [64]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [68]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [6C]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [70]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [74]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [78]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [7C]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [80]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [84]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [88]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [8C]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [90]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [94]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [98]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [9C]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [A0]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [A4]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [A8]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [AC]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [B0]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [B4]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [B8]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [BC]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [C0]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [C4]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [C8]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [CC]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [D0]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [D4]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [D8]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [DC]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [E0]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [E4]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [E8]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [EC]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [F0]  */	{"crc32b",TERM,SSE4CRCb,0},	{"crc32",TERM,SSE4CRC,1},
+		INVALID,	INVALID,
+/*  [F4]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [F8]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [FC]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+};
+
+/*
+ * Decode table for 0x0F3A opcodes
+ */
+static const struct instable op0F3A[112] = {
+/*  [00]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [04]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [08]  */	{"roundps",TERM,SSE4i,0},	{"roundpd",TERM,SSE4i,0},
+		{"roundss",TERM,SSE4i,0},	{"roundsd",TERM,SSE4i,0},
+/*  [0C]  */	{"blendps",TERM,SSE4i,0},	{"blendpd",TERM,SSE4i,0},
+		{"pblendw",TERM,SSE4i,0},	{"palignr",TERM,MNIi,0},
+/*  [10]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [14]  */	{"pextrb",TERM,SSE4itm,0},	{"pextrw",TERM,SSE4itm,0},
+		{"pextr",TERM,SSE4itm,0},	{"extractps",TERM,SSE4itm,0},
+/*  [18]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [1C]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [20]  */	{"pinsrb",TERM,SSE4ifm,0},	{"insertps",TERM,SSE4i,0},
+		{"pinsr",TERM,SSE4ifm,0},	INVALID,
+/*  [24]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [28]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [2C]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [30]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [34]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [38]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [3C]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [40]  */	{"dpps",TERM,SSE4i,0},	{"dppd",TERM,SSE4i,0},
+		{"mpsadbw",TERM,SSE4i,0},	INVALID,
+/*  [44]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [48]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [4C]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [50]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [54]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [58]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [5C]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [60]  */	{"pcmpestrm",TERM,SSE4i,0},	{"pcmpestri",TERM,SSE4i,0},
+		{"pcmpistrm",TERM,SSE4i,0},	{"pcmpistri",TERM,SSE4i,0},
+/*  [64]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [68]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+/*  [6C]  */	INVALID,	INVALID,
+		INVALID,	INVALID,
+};
+
 static const struct instable op_monitor = {"monitor",TERM,GO_ON,0};
 static const struct instable op_mwait   = {"mwait",TERM,GO_ON,0};
+
+/* These opcode tables entries are only used for the 64-bit architecture */
+static const struct instable op_swapgs = {"swapgs",TERM,GO_ON,0};
+static const struct instable op_syscall = {"syscall",TERM,GO_ON,0};
+static const struct instable op_sysret = {"sysret",TERM,GO_ON,0};
+static const struct instable opREX = {"",TERM,REX,0};
+static const struct instable op_movsl = {"movsl",TERM,MOVZ,1};
 
 /*
  * Decode table for 0x0F0F opcodes
@@ -635,12 +917,13 @@ static const struct instable op0FAE[8] = {
 static const struct instable op0F[16][16] = {
 /*  [00]  */ {  {"",op0F00,TERM,0},	{"",op0F01,TERM,0},
 		{"lar",TERM,MR,0},	{"lsl",TERM,MR,0},
-/*  [04]  */	INVALID,		INVALID,
-		{"clts",TERM,GO_ON,0},	INVALID,
+/*  [04]  */	INVALID,		{INVALID_32,&op_syscall},
+		{"clts",TERM,GO_ON,0},  {INVALID_32,&op_sysret},
 /*  [08]  */	{"invd",TERM,GO_ON,0},	{"wbinvd",TERM,GO_ON,0},
 		INVALID,		{"ud2",TERM,GO_ON,0},
-/*  [0C]  */   INVALID,                {"prefetch",TERM,PFCH3DNOW,1},
-               {"femms",TERM,GO_ON,0}, {"",(const struct instable *)op0F0F,TERM,0} },
+/*  [0C]  */	INVALID,                {"prefetch",TERM,PFCH3DNOW,1},
+		{"femms",TERM,GO_ON,0},
+				{"",(const struct instable *)op0F0F,TERM,0} },
 /*  [10]  */ {  {"mov",TERM,SSE2,0},	{"mov",TERM,SSE2tm,0},
 		{"mov",TERM,SSE2,0},	{"movl",TERM,SSE2tm,0},
 /*  [14]  */	{"unpckl",TERM,SSE2,0},	{"unpckh",TERM,SSE2,0},
@@ -648,11 +931,11 @@ static const struct instable op0F[16][16] = {
 /*  [18]  */	{"prefetch",TERM,PFCH,1},INVALID,
 		INVALID,		INVALID,
 /*  [1C]  */	INVALID,		INVALID,
-		INVALID,		INVALID },
-/*  [20]  */ {  {"mov",TERM,SREG,1},	{"mov",TERM,SREG,1},
-		{"mov",TERM,SREG,1},	{"mov",TERM,SREG,1},
-/*  [24]  */	{"mov",TERM,SREG,1},	INVALID,
-		{"mov",TERM,SREG,1},	INVALID,
+		INVALID,		{"nop",TERM,M,1} },
+/*  [20]  */ {  {"mov",TERM,SREG,0x03},	{"mov",TERM,SREG,0x03},
+		{"mov",TERM,SREG,0x03},	{"mov",TERM,SREG,0x03},
+/*  [24]  */	{"mov",TERM,SREG,0x03},	INVALID,
+		{"mov",TERM,SREG,0x03},	INVALID,
 /*  [28]  */	{"mova",TERM,SSE2,0},	{"mova",TERM,SSE2tm,0},
 		{"cvt",TERM,SSE2,0},	{"movnt",TERM,SSE2tm,0},
 /*  [2C]  */	{"cvt",TERM,SSE2,0},	{"cvt",TERM,SSE2,0} ,
@@ -661,8 +944,8 @@ static const struct instable op0F[16][16] = {
 		{"rdmsr",TERM,GO_ON,0},	{"rdpmc",TERM,GO_ON,0},
 /*  [34]  */	{"sysenter",TERM,GO_ON,0},{"sysexit",TERM,GO_ON,0},
 		INVALID,		INVALID,
-/*  [38]  */	INVALID,		INVALID,
-		INVALID,		INVALID,
+/*  [38]  */	{"",op0F38,TERM,0},		INVALID,
+		{"",op0F3A,TERM,0},		INVALID,
 /*  [3C]  */	INVALID,		INVALID,
 		INVALID,		INVALID },
 /*  [40]  */ {  {"cmovo",TERM,MRw,1},	{"cmovno",TERM,MRw,1},
@@ -693,39 +976,39 @@ static const struct instable op0F[16][16] = {
 		{"ps",TERM,SSE2i1,0},	{"ps",TERM,SSE2i1,0},
 /*  [74]  */	{"pcmpeqb",TERM,SSE2,0},{"pcmpeqw",TERM,SSE2,0},
 		{"pcmpeqd",TERM,SSE2,0},{"emms",TERM,GO_ON,0},
-/*  [78]  */	INVALID,		INVALID,
+/*  [78]  */	{"vmread",TERM,RMw,0},  {"vmwrite",TERM,MRw,0},
 		INVALID,		INVALID,
 /*  [7C]  */	{"haddp",TERM,SSE2,0},  {"hsubp",TERM,SSE2,0},
 		{"mov",TERM,SSE2tfm,0},	{"mov",TERM,SSE2tm,0} },
-/*  [80]  */ {  {"jo",TERM,D,1},	{"jno",TERM,D,1},
-		{"jb",TERM,D,1},	{"jae",TERM,D,1},
-/*  [84]  */	{"je",TERM,D,1},	{"jne",TERM,D,1},
-		{"jbe",TERM,D,1},	{"ja",TERM,D,1},
-/*  [88]  */	{"js",TERM,D,1},	{"jns",TERM,D,1},
-		{"jp",TERM,D,1},	{"jnp",TERM,D,1},
-/*  [8C]  */	{"jl",TERM,D,1},	{"jge",TERM,D,1},
-		{"jle",TERM,D,1},	{"jg",TERM,D,1} },
-/*  [90]  */ {  {"seto",TERM,Mb,1},	{"setno",TERM,Mb,1},
-		{"setb",TERM,Mb,1},	{"setae",TERM,Mb,1},
-/*  [94]  */	{"sete",TERM,Mb,1},	{"setne",TERM,Mb,1},
-		{"setbe",TERM,Mb,1},	{"seta",TERM,Mb,1},
-/*  [98]  */	{"sets",TERM,Mb,1},	{"setns",TERM,Mb,1},
-		{"setp",TERM,Mb,1},	{"setnp",TERM,Mb,1},
-/*  [9C]  */	{"setl",TERM,Mb,1},	{"setge",TERM,Mb,1},
-		{"setle",TERM,Mb,1},	{"setg",TERM,Mb,1} },
-/*  [A0]  */ {  {"push",TERM,LSEG,1},	{"pop",TERM,LSEG,1},
+/*  [80]  */ {  {"jo",TERM,D,0x03},	{"jno",TERM,D,0x03},
+		{"jb",TERM,D,0x03},	{"jae",TERM,D,0x03},
+/*  [84]  */	{"je",TERM,D,0x03},	{"jne",TERM,D,0x03},
+		{"jbe",TERM,D,0x03},	{"ja",TERM,D,0x03},
+/*  [88]  */	{"js",TERM,D,0x03},	{"jns",TERM,D,0x03},
+		{"jp",TERM,D,0x03},	{"jnp",TERM,D,0x03},
+/*  [8C]  */	{"jl",TERM,D,0x03},	{"jge",TERM,D,0x03},
+		{"jle",TERM,D,0x03},	{"jg",TERM,D,0x03} },
+/*  [90]  */ {  {"seto",TERM,Mb,0},	{"setno",TERM,Mb,0},
+		{"setb",TERM,Mb,0},	{"setae",TERM,Mb,0},
+/*  [94]  */	{"sete",TERM,Mb,0},	{"setne",TERM,Mb,0},
+		{"setbe",TERM,Mb,0},	{"seta",TERM,Mb,0},
+/*  [98]  */	{"sets",TERM,Mb,0},	{"setns",TERM,Mb,0},
+		{"setp",TERM,Mb,0},	{"setnp",TERM,Mb,0},
+/*  [9C]  */	{"setl",TERM,Mb,0},	{"setge",TERM,Mb,0},
+		{"setle",TERM,Mb,0},	{"setg",TERM,Mb,0} },
+/*  [A0]  */ {  {"push",TERM,LSEG,0x03},{"pop",TERM,LSEG,0x03},
 		{"cpuid",TERM,GO_ON,0},	{"bt",TERM,RMw,1},
 /*  [A4]  */	{"shld",TERM,DSHIFT,1},	{"shld",TERM,DSHIFTcl,1},
 		INVALID,		INVALID,
-/*  [A8]  */	{"push",TERM,LSEG,1},	{"pop",TERM,LSEG,1},
-		{"rsm",TERM,GO_ON,0},	{"bts",TERM,RMw,1},
+/*  [A8]  */	{"push",TERM,LSEG,0x03},{"pop",TERM,LSEG,0x03},
+		{"rsm",TERM,GO_ON,0, INVALID_64}, {"bts",TERM,RMw,1},
 /*  [AC]  */	{"shrd",TERM,DSHIFT,1},	{"shrd",TERM,DSHIFTcl,1},
 		{"",op0FAE,TERM,0},	{"imul",TERM,MRw,1} },
 /*  [B0]  */ {  {"cmpxchgb",TERM,XINST,0},{"cmpxchg",TERM,XINST,1},
 		{"lss",TERM,MR,0},	{"btr",TERM,RMw,1},
 /*  [B4]  */	{"lfs",TERM,MR,0},	{"lgs",TERM,MR,0},
 		{"movzb",TERM,MOVZ,1},	{"movzwl",TERM,MOVZ,0},
-/*  [B8]  */	INVALID,		INVALID,
+/*  [B8]  */	{"popcnt",TERM,SSE4MRw,0},		INVALID,
 		{"",op0FBA,TERM,0},	{"btc",TERM,RMw,1},
 /*  [BC]  */	{"bsf",TERM,MRw,1},	{"bsr",TERM,MRw,1},
 		{"movsb",TERM,MOVZ,1},	{"movswl",TERM,MOVZ,0} },
@@ -901,44 +1184,44 @@ static const struct instable opFF[8] = {
 /*  [0]  */	{"inc",TERM,Mw,1},	{"dec",TERM,Mw,1},
 		{"call",TERM,INM,1},	{"lcall",TERM,INMl,1},
 /*  [4]  */	{"jmp",TERM,INM,1},	{"ljmp",TERM,INMl,1},
-		{"push",TERM,M,1},	INVALID,
+		{"push",TERM,M,0x03},	INVALID,
 };
 
 /* for 287 instructions, which are a mess to decode */
 static const struct instable opFP1n2[8][8] = {
 /* bit pattern:	1101 1xxx MODxx xR/M */
-/*  [0,0]  */ { {"fadds",TERM,M,1},	{"fmuls",TERM,M,1},
-		{"fcoms",TERM,M,1},	{"fcomps",TERM,M,1},
-/*  [0,4]  */	{"fsubs",TERM,M,1},	{"fsubrs",TERM,M,1},
-		{"fdivs",TERM,M,1},	{"fdivrs",TERM,M,1} },
-/*  [1,0]  */ { {"flds",TERM,M,1},	INVALID,
-		{"fsts",TERM,M,1},	{"fstps",TERM,M,1},
+/*  [0,0]  */ { {"fadds",TERM,M,0},	{"fmuls",TERM,M,0},
+		{"fcoms",TERM,M,0},	{"fcomps",TERM,M,0},
+/*  [0,4]  */	{"fsubs",TERM,M,0},	{"fsubrs",TERM,M,0},
+		{"fdivs",TERM,M,0},	{"fdivrs",TERM,M,0} },
+/*  [1,0]  */ { {"flds",TERM,M,0},	INVALID,
+		{"fsts",TERM,M,0},	{"fstps",TERM,M,0},
 /*  [1,4]  */	{"fldenv",TERM,M,1},	{"fldcw",TERM,M,1},
 		{"fnstenv",TERM,M,1},	{"fnstcw",TERM,M,1} },
-/*  [2,0]  */ { {"fiaddl",TERM,M,1},	{"fimull",TERM,M,1},
-		{"ficoml",TERM,M,1},	{"ficompl",TERM,M,1},
-/*  [2,4]  */	{"fisubl",TERM,M,1},	{"fisubrl",TERM,M,1},
-		{"fidivl",TERM,M,1},	{"fidivrl",TERM,M,1} },
-/*  [3,0]  */ { {"fildl",TERM,Mnol,1},	{"fisttpl",TERM,M,1},
-		{"fistl",TERM,M,1},	{"fistpl",TERM,Mnol,1},
-/*  [3,4]  */	INVALID,		{"fldt",TERM,M,1},
-		INVALID,		{"fstpt",TERM,M,1} },
-/*  [4,0]  */ { {"faddl",TERM,M,1},	{"fmull",TERM,M,1},
-		{"fcoml",TERM,M,1},	{"fcompl",TERM,M,1},
-/*  [4,1]  */	{"fsubl",TERM,M,1},	{"fsubrl",TERM,M,1},
-		{"fdivl",TERM,M,1},	{"fdivrl",TERM,M,1} },
-/*  [5,0]  */ { {"fldl",TERM,M,1},	{"fisttpll",TERM,M,1},
-		{"fstl",TERM,M,1},	{"fstpl",TERM,M,1},
+/*  [2,0]  */ { {"fiaddl",TERM,M,0},	{"fimull",TERM,M,0},
+		{"ficoml",TERM,M,0},	{"ficompl",TERM,M,0},
+/*  [2,4]  */	{"fisubl",TERM,M,0},	{"fisubrl",TERM,M,0},
+		{"fidivl",TERM,M,0},	{"fidivrl",TERM,M,0} },
+/*  [3,0]  */ { {"fildl",TERM,Mnol,0},	{"fisttpl",TERM,M,0},
+		{"fistl",TERM,M,0},	{"fistpl",TERM,Mnol,0},
+/*  [3,4]  */	INVALID,		{"fldt",TERM,M,0},
+		INVALID,		{"fstpt",TERM,M,0} },
+/*  [4,0]  */ { {"faddl",TERM,M,0},	{"fmull",TERM,M,0},
+		{"fcoml",TERM,M,0},	{"fcompl",TERM,M,0},
+/*  [4,1]  */	{"fsubl",TERM,M,0},	{"fsubrl",TERM,M,0},
+		{"fdivl",TERM,M,0},	{"fdivrl",TERM,M,0} },
+/*  [5,0]  */ { {"fldl",TERM,M,0},	{"fisttpll",TERM,M,0},
+		{"fstl",TERM,M,0},	{"fstpl",TERM,M,0},
 /*  [5,4]  */	{"frstor",TERM,M,1},	INVALID,
 		{"fnsave",TERM,M,1},	{"fnstsw",TERM,M,1} },
-/*  [6,0]  */ { {"fiadds",TERM,M,1},	{"fimuls",TERM,M,1},
-		{"ficoms",TERM,M,1},	{"ficomps",TERM,M,1},
-/*  [6,4]  */	{"fisubs",TERM,M,1},	{"fisubrs",TERM,M,1},
-		{"fidivs",TERM,M,1},	{"fidivrs",TERM,M,1} },
-/*  [7,0]  */ { {"filds",TERM,M,1},	{"fisttps",TERM,M,1},
-		{"fists",TERM,M,1},	{"fistps",TERM,M,1},
-/*  [7,4]  */	{"fbld",TERM,M,1},	{"fildq",TERM,M,1},
-		{"fbstp",TERM,M,1},	{"fistpq",TERM,M,1} },
+/*  [6,0]  */ { {"fiadds",TERM,M,0},	{"fimuls",TERM,M,0},
+		{"ficoms",TERM,M,0},	{"ficomps",TERM,M,0},
+/*  [6,4]  */	{"fisubs",TERM,M,0},	{"fisubrs",TERM,M,0},
+		{"fidivs",TERM,M,0},	{"fidivrs",TERM,M,0} },
+/*  [7,0]  */ { {"filds",TERM,M,0},	{"fisttps",TERM,M,0},
+		{"fists",TERM,M,0},	{"fistps",TERM,M,0},
+/*  [7,4]  */	{"fbld",TERM,M,0},	{"fildq",TERM,M,0},
+		{"fbstp",TERM,M,0},	{"fistpq",TERM,M,0} },
 };
 
 static const struct instable opFP3[8][8] = {
@@ -1016,58 +1299,68 @@ static const struct instable distable[16][16] = {
 /* [0,0] */  {  {"addb",TERM,RMw,0},	{"add",TERM,RMw,1},
 		{"addb",TERM,MRw,0},	{"add",TERM,MRw,1},
 /* [0,4] */	{"addb",TERM,IA,0},	{"add",TERM,IA,1},
-		{"push",TERM,SEG,1},	{"pop",TERM,SEG,1},
+		{"push",TERM,SEG,0x03,INVALID_64},
+					{"pop",TERM,SEG,0x03,INVALID_64},
 /* [0,8] */	{"orb",TERM,RMw,0},	{"or",TERM,RMw,1},
 		{"orb",TERM,MRw,0},	{"or",TERM,MRw,1},
 /* [0,C] */	{"orb",TERM,IA,0},	{"or",TERM,IA,1},
-		{"push",TERM,SEG,1},
-		{"",(const struct instable *)op0F,TERM,0} },
+		{"push",TERM,SEG,0x03,INVALID_64},
+				    {"",(const struct instable *)op0F,TERM,0} },
 /* [1,0] */  {  {"adcb",TERM,RMw,0},	{"adc",TERM,RMw,1},
 		{"adcb",TERM,MRw,0},	{"adc",TERM,MRw,1},
 /* [1,4] */	{"adcb",TERM,IA,0},	{"adc",TERM,IA,1},
-		{"push",TERM,SEG,1},	{"pop",TERM,SEG,1},
+		{"push",TERM,SEG,0x03,INVALID_64},
+					{"pop",TERM,SEG,0x03,INVALID_64},
 /* [1,8] */	{"sbbb",TERM,RMw,0},	{"sbb",TERM,RMw,1},
 		{"sbbb",TERM,MRw,0},	{"sbb",TERM,MRw,1},
 /* [1,C] */	{"sbbb",TERM,IA,0},	{"sbb",TERM,IA,1},
-		{"push",TERM,SEG,1},	{"pop",TERM,SEG,1} },
+		{"push",TERM,SEG,0x03,INVALID_64},
+					{"pop",TERM,SEG,0x03,INVALID_64} },
 /* [2,0] */  {  {"andb",TERM,RMw,0},	{"and",TERM,RMw,1},
 		{"andb",TERM,MRw,0},	{"and",TERM,MRw,1},
 /* [2,4] */	{"andb",TERM,IA,0},	{"and",TERM,IA,1},
-		{"%es:",TERM,OVERRIDE,0}, {"daa",TERM,GO_ON,0},
+		{"%es:",TERM,OVERRIDE,0},
+					{"daa",TERM,GO_ON,0,INVALID_64},
 /* [2,8] */	{"subb",TERM,RMw,0},	{"sub",TERM,RMw,1},
 		{"subb",TERM,MRw,0},	{"sub",TERM,MRw,1},
 /* [2,C] */	{"subb",TERM,IA,0},	{"sub",TERM,IA,1},
-		{"%cs:",TERM,OVERRIDE,0}, {"das",TERM,GO_ON,0} },
+		{"%cs:",TERM,OVERRIDE,0},
+					{"das",TERM,GO_ON,0,INVALID_64} },
 /* [3,0] */  {  {"xorb",TERM,RMw,0},	{"xor",TERM,RMw,1},
 		{"xorb",TERM,MRw,0},	{"xor",TERM,MRw,1},
 /* [3,4] */	{"xorb",TERM,IA,0},	{"xor",TERM,IA,1},
-		{"%ss:",TERM,OVERRIDE,0}, {"aaa",TERM,GO_ON,0},
+		{"%ss:",TERM,OVERRIDE,0},
+					{"aaa",TERM,GO_ON,0,INVALID_64},
 /* [3,8] */	{"cmpb",TERM,RMw,0},	{"cmp",TERM,RMw,1},
 		{"cmpb",TERM,MRw,0},	{"cmp",TERM,MRw,1},
 /* [3,C] */	{"cmpb",TERM,IA,0},	{"cmp",TERM,IA,1},
-		{"%ds:",TERM,OVERRIDE,0}, {"aas",TERM,GO_ON,0} },
-/* [4,0] */  {  {"inc",TERM,R,1},	{"inc",TERM,R,1},
-		{"inc",TERM,R,1},	{"inc",TERM,R,1},
-/* [4,4] */	{"inc",TERM,R,1},	{"inc",TERM,R,1},
-		{"inc",TERM,R,1},	{"inc",TERM,R,1},
-/* [4,8] */	{"dec",TERM,R,1},	{"dec",TERM,R,1},
-		{"dec",TERM,R,1},	{"dec",TERM,R,1},
-/* [4,C] */	{"dec",TERM,R,1},	{"dec",TERM,R,1},
-		{"dec",TERM,R,1},	{"dec",TERM,R,1} },
-/* [5,0] */  {  {"push",TERM,R,1},	{"push",TERM,R,1},
-		{"push",TERM,R,1},	{"push",TERM,R,1},
-/* [5,4] */	{"push",TERM,R,1},	{"push",TERM,R,1},
-		{"push",TERM,R,1},	{"push",TERM,R,1},
-/* [5,8] */	{"pop",TERM,R,1},	{"pop",TERM,R,1},
-		{"pop",TERM,R,1},	{"pop",TERM,R,1},
-/* [5,C] */	{"pop",TERM,R,1},	{"pop",TERM,R,1},
-		{"pop",TERM,R,1},	{"pop",TERM,R,1} },
-/* [6,0] */  {  {"pusha",TERM,GO_ON,1},	{"popa",TERM,GO_ON,1},
-		{"bound",TERM,MR,1},	{"arpl",TERM,RMw,0},
-/* [6,4] */	{"%fs:",TERM,OVERRIDE,0}, {"%gs:",TERM,OVERRIDE,0},
+		{"%ds:",TERM,OVERRIDE,0},
+					{"aas",TERM,GO_ON,0,INVALID_64} },
+/* [4,0] */  {  {"inc",TERM,R,1,&opREX},{"inc",TERM,R,1,&opREX},
+		{"inc",TERM,R,1,&opREX},{"inc",TERM,R,1,&opREX},
+/* [4,4] */	{"inc",TERM,R,1,&opREX},{"inc",TERM,R,1,&opREX},
+		{"inc",TERM,R,1,&opREX},{"inc",TERM,R,1,&opREX},
+/* [4,8] */	{"dec",TERM,R,1,&opREX},{"dec",TERM,R,1,&opREX},
+		{"dec",TERM,R,1,&opREX},{"dec",TERM,R,1,&opREX},
+/* [4,C] */	{"dec",TERM,R,1,&opREX},{"dec",TERM,R,1,&opREX},
+		{"dec",TERM,R,1,&opREX},{"dec",TERM,R,1,&opREX} },
+/* [5,0] */  {  {"push",TERM,R,0x03},	{"push",TERM,R,0x03},
+		{"push",TERM,R,0x03},	{"push",TERM,R,0x03},
+/* [5,4] */	{"push",TERM,R,0x03},	{"push",TERM,R,0x03},
+		{"push",TERM,R,0x03},	{"push",TERM,R,0x03},
+/* [5,8] */	{"pop",TERM,R,0x03},	{"pop",TERM,R,0x03},
+		{"pop",TERM,R,0x03},	{"pop",TERM,R,0x03},
+/* [5,C] */	{"pop",TERM,R,0x03},	{"pop",TERM,R,0x03},
+		{"pop",TERM,R,0x03},	{"pop",TERM,R,0x03} },
+/* [6,0] */  {  {"pusha",TERM,GO_ON,1,INVALID_64},
+					{"popa",TERM,GO_ON,1,INVALID_64},
+		{"bound",TERM,MR,1,INVALID_64},
+					{"arpl",TERM,RMw,0,&op_movsl},
+/* [6,4] */	{"%fs:",TERM,OVERRIDE,0},
+					{"%gs:",TERM,OVERRIDE,0},
 		{"data16",TERM,DM,0},	{"addr16",TERM,AM,0},
-/* [6,8] */	{"push",TERM,I,1},	{"imul",TERM,IMUL,1},
-		{"push",TERM,Ib,1},	{"imul",TERM,IMUL,1},
+/* [6,8] */	{"push",TERM,I,0x03},	{"imul",TERM,IMUL,1},
+		{"push",TERM,Ib,0x03},	{"imul",TERM,IMUL,1},
 /* [6,C] */	{"insb",TERM,GO_ON,0},	{"ins",TERM,GO_ON,1},
 		{"outsb",TERM,GO_ON,0},	{"outs",TERM,GO_ON,1} },
 /* [7,0] */  {  {"jo",TERM,BD,0},	{"jno",TERM,BD,0},
@@ -1085,7 +1378,7 @@ static const struct instable distable[16][16] = {
 /* [8,8] */	{"movb",TERM,RMw,0},	{"mov",TERM,RMw,1},
 		{"movb",TERM,MRw,0},	{"mov",TERM,MRw,1},
 /* [8,C] */	{"mov",TERM,SM,1},	{"lea",TERM,MR,1},
-		{"mov",TERM,MS,1},	{"pop",TERM,M,1} },
+		{"mov",TERM,MS,1},	{"pop",TERM,M,0x03} },
 /* [9,0] */  {  {"nop",TERM,GO_ON,0},	{"xchg",TERM,RA,1},
 		{"xchg",TERM,RA,1},	{"xchg",TERM,RA,1},
 /* [9,4] */	{"xchg",TERM,RA,1},	{"xchg",TERM,RA,1},
@@ -1106,21 +1399,24 @@ static const struct instable distable[16][16] = {
 		{"movb",TERM,IR,0},	{"movb",TERM,IR,0},
 /* [B,4] */	{"movb",TERM,IR,0},	{"movb",TERM,IR,0},
 		{"movb",TERM,IR,0},	{"movb",TERM,IR,0},
-/* [B,8] */	{"mov",TERM,IR,1},	{"mov",TERM,IR,1},
-		{"mov",TERM,IR,1},	{"mov",TERM,IR,1},
-/* [B,C] */	{"mov",TERM,IR,1},	{"mov",TERM,IR,1},
-		{"mov",TERM,IR,1},	{"mov",TERM,IR,1} },
+/* [B,8] */	{"mov",TERM,IR64,1},	{"mov",TERM,IR64,1},
+		{"mov",TERM,IR64,1},	{"mov",TERM,IR64,1},
+/* [B,C] */	{"mov",TERM,IR64,1},	{"mov",TERM,IR64,1},
+		{"mov",TERM,IR64,1},	{"mov",TERM,IR64,1} },
 /* [C,0] */  {  {"",opC0,TERM,0},	{"",opC1,TERM,0},
 		{"ret",TERM,RET,0},	{"ret",TERM,GO_ON,0},
-/* [C,4] */	{"les",TERM,MR,0},	{"lds",TERM,MR,0},
+/* [C,4] */	{"les",TERM,MR,0,INVALID_64},
+					{"lds",TERM,MR,0,INVALID_64},
 		{"movb",TERM,IMw,0},	{"mov",TERM,IMw,1},
 /* [C,8] */	{"enter",TERM,ENTER,0},	{"leave",TERM,GO_ON,0},
 		{"lret",TERM,RET,0},	{"lret",TERM,GO_ON,0},
 /* [C,C] */	{"int",TERM,INT3,0},	{"int",TERM,Ib,0},
-		{"into",TERM,GO_ON,0},	{"iret",TERM,GO_ON,0} },
+		{"into",TERM,GO_ON,0,INVALID_64},
+					{"iret",TERM,GO_ON,0} },
 /* [D,0] */  {  {"",opD0,TERM,0},	{"",opD1,TERM,0},
 		{"",opD2,TERM,0},	{"",opD3,TERM,0},
-/* [D,4] */	{"aam",TERM,U,0},	{"aad",TERM,U,0},
+/* [D,4] */	{"aam",TERM,U,0,INVALID_64},
+					{"aad",TERM,U,0,INVALID_64},
 		{"falc",TERM,GO_ON,0},	{"xlat",TERM,GO_ON,0},
 /* 287 instructions.  Note that although the indirect field		*/
 /* indicates opFP1n2 for further decoding, this is not necessarily	*/
@@ -1139,7 +1435,7 @@ static const struct instable distable[16][16] = {
 		{"loop",TERM,BD,0},	{"jcxz",TERM,BD,0},
 /* [E,4] */	{"inb",TERM,Pi,0},	{"in",TERM,Pi,1},
 		{"outb",TERM,Po,0},	{"out",TERM,Po,1},
-/* [E,8] */	{"call",TERM,D,1},	{"jmp",TERM,D,1},
+/* [E,8] */	{"call",TERM,D,0x03},	{"jmp",TERM,D,0x03},
 		{"ljmp",TERM,SO,0},	{"jmp",TERM,BD,0},
 /* [E,C] */	{"inb",TERM,Vi,0},	{"in",TERM,Vi,1},
 		{"outb",TERM,Vo,0},	{"out",TERM,Vo,1} },
@@ -1153,6 +1449,50 @@ static const struct instable distable[16][16] = {
 		{"",opFE,TERM,0},	{"",opFF,TERM,0} },
 };
 
+static const char *get_reg_name(int reg, int wbit, int data16, int rex)
+{
+	const char *reg_name;
+	
+	// A REX prefix takes precedent over a 66h prefix.
+	if (rex != 0) {
+		reg_name = REG32[reg + (REX_R(rex) << 3)][wbit + REX_W(rex)];
+	} else if (data16) {
+		reg_name = REG16[reg][wbit];
+	} else {
+		reg_name = REG32[reg][wbit];
+	}
+	
+	return reg_name;
+}
+
+static const char *get_r_m_name(int r_m, int wbit, int data16, int rex)
+{
+	const char *reg_name;
+	
+	// A REX prefix takes precedent over a 66h prefix.
+	if (rex != 0) {
+		reg_name = REG32[r_m + (REX_B(rex) << 3)][wbit + REX_W(rex)];
+	} else if (data16) {
+		reg_name = REG16[r_m][wbit];
+	} else {
+		reg_name = REG32[r_m][wbit];
+	}
+	
+	return reg_name;
+}
+
+// Returns the xmm register number referenced by reg and rex.
+static unsigned int xmm_reg(int reg, int rex)
+{
+	return (reg + (REX_R(rex) << 3));
+}
+
+// Returns the xmm register number referenced by r_m and rex.
+static unsigned int xmm_rm(int r_m, int rex)
+{
+	return (r_m + (REX_B(rex) << 3));
+}
+
 /*
  * i386_disassemble()
  */
@@ -1160,21 +1500,24 @@ unsigned long
 i386_disassemble(
 char *sect,
 unsigned long left,
-unsigned long addr,
-unsigned long sect_addr,
+uint64_t addr,
+uint64_t sect_addr,
 enum byte_sex object_byte_sex,
 struct relocation_info *sorted_relocs,
 unsigned long nsorted_relocs,
-nlist_t *symbols,
+struct nlist *symbols,
+struct nlist_64 *symbols64,
 unsigned long nsymbols,
 struct symbol *sorted_symbols,
 unsigned long nsorted_symbols,
 char *strings,
 unsigned long strings_size,
-unsigned long *indirect_symbols,
+uint32_t *indirect_symbols,
 unsigned long nindirect_symbols,
-mach_header_t *mh,
+cpu_type_t cputype,
 struct load_command *load_commands,
+uint32_t ncmds,
+uint32_t sizeofcmds,
 enum bool verbose)
 {
     char mnemonic[MAX_MNEMONIC+2]; /* one extra for suffix */
@@ -1182,11 +1525,12 @@ enum bool verbose)
     const char *symbol0, *symbol1;
     const char *symadd0, *symsub0, *symadd1, *symsub1;
     unsigned long value0, value1;
+    unsigned long long imm0, imm1;
     unsigned long value0_size, value1_size;
     char result0[MAX_RESULT], result1[MAX_RESULT];
     const char *indirect_symbol_name;
 
-    unsigned long length;
+    unsigned long i, length;
     unsigned char byte;
        unsigned char opcode_suffix;
     /* nibbles (4 bits) of the opcode */
@@ -1200,6 +1544,7 @@ enum bool verbose)
     enum bool addr16;		/* 16- or 32-bit addressing */
     enum bool sse2;		/* sse2 instruction using xmmreg's */
     enum bool mmx;		/* mmx instruction using mmreg's */
+    unsigned char rex, rex_save;/* x86-64 REX prefix */
 
 	if(left == 0){
 	   printf("(end of section)\n");
@@ -1220,6 +1565,7 @@ enum bool verbose)
 	addr16 = FALSE;
 	sse2 = FALSE;
 	mmx = FALSE;
+	rex = 0;
 	reg_name = NULL;
 	wbit = 0;
 
@@ -1241,6 +1587,9 @@ enum bool verbose)
 	    opcode2 = byte & 0xf;
 
 	    dp = &distable[opcode1][opcode2];
+	    if((cputype & CPU_ARCH_ABI64) == CPU_ARCH_ABI64 &&
+	       dp->arch64 != NULL)
+		dp = dp->arch64;
 
 	    if(dp->adr_mode == PREFIX){
 		if(prefix_dp != NULL)
@@ -1260,11 +1609,20 @@ enum bool verbose)
 		seg = dp->name;
 		prefix_byte = byte;
 	    }
+	    else if(dp->adr_mode == REX){
+		rex = byte;
+		/*
+		 * REX is a prefix, but we don't set prefix_byte here because
+		 * we use that to detect things related to the other prefixes
+		 * and we don't want the existence of those bytes to be hidden
+		 * by the presence of a REX prefix.
+		 */
+	    }
 	    else
 		break;
 	}
 
-       got_modrm_byte = FALSE;
+	got_modrm_byte = FALSE;
 
 	/*
 	 * Some 386 instructions have 2 bytes of opcode before the mod_r/m
@@ -1275,6 +1633,17 @@ enum bool verbose)
 	    opcode4 = byte >> 4 & 0xf;
 	    opcode5 = byte & 0xf;
 	    dp = &op0F[opcode4][opcode5];
+	    if((cputype & CPU_ARCH_ABI64) == CPU_ARCH_ABI64 &&
+	       dp->arch64 != NULL)
+		dp = dp->arch64;
+	    if(dp->indirect == op0F38 || dp->indirect == op0F3A){
+		/*
+		 * MNI instructions are SSE2ish instructions with an
+		 * extra byte.  Do the extra indirection here.
+		 */
+		byte = get_value(sizeof(char), sect, &length, &left);
+		dp = &dp->indirect[byte];
+	    }
 	    /*
 	     * SSE and SSE2 instructions have 3 bytes of opcode and the
 	     * "third opcode byte" is before the other two (where the prefix
@@ -1285,7 +1654,13 @@ enum bool verbose)
 	       dp->adr_mode == SSE2i ||
 	       dp->adr_mode == SSE2i1 ||
 	       dp->adr_mode == SSE2tm ||
-	       dp->adr_mode == SSE2tfm){
+	       dp->adr_mode == SSE2tfm ||
+	       dp->adr_mode == SSE4 ||
+	       dp->adr_mode == SSE4i ||
+	       dp->adr_mode == SSE4MRw ||
+	       dp->adr_mode == SSE4CRC ||
+	       dp->adr_mode == SSE4CRCb ||
+	       (byte == 0xc7 && prefix_byte == 0xf3)){ /* for vmxon */
 		prefix_dp = NULL;
 	    }
 	    else{
@@ -1324,6 +1699,12 @@ enum bool verbose)
 			mmx = TRUE;
 			dp = &op_mwait;
 		    }
+		    if((cputype & CPU_ARCH_ABI64) == CPU_ARCH_ABI64){
+			if(opcode3 == 0x7 && got_modrm_byte &&
+			   mode == REG_ONLY && r_m == 0) {
+			    dp = &op_swapgs;
+			}
+		    }
 		}
 		else{
 		    /*
@@ -1350,8 +1731,21 @@ enum bool verbose)
 	     * Since the opcode is not an SSE or SSE2 instruction print the
 	     * delayed last prefix if any.
 	     */
-	    if(prefix_dp != NULL)
-		printf(prefix_dp->name);
+	    if(prefix_dp != NULL){
+		/*
+		 * If the prefix is "repz" and the instruction is ins, outs,
+		 * movs, lods, or stos then the name used is "rep".
+		 */
+		if(strcmp(prefix_dp->name, "repz/") == 0 &&
+		   (byte == 0x6c || byte == 0x6d || /* ins */
+		    byte == 0x6e || byte == 0x6f || /* outs */
+		    byte == 0xa4 || byte == 0xa5 || /* movs */
+		    byte == 0xac || byte == 0xad || /* lods */
+		    byte == 0xaa || byte == 0xab))  /* stos */
+		    printf("rep/");
+		else
+		    printf(prefix_dp->name);
+	    }
 	}
 
 	if(dp->indirect != TERM){
@@ -1396,21 +1790,43 @@ enum bool verbose)
 	    printf(".byte 0x%02x #bad opcode\n", (unsigned int)byte);
 	    return(length);
 	}
+	
+	/*
+	 * Some addressing modes are implicitly 64-bit.  Set REX.W for those
+	 * so we don't have to change the logic for them later.
+	 */
+	if((cputype & CPU_ARCH_ABI64) == CPU_ARCH_ABI64){
+	    if((dp->flags & IS_POINTER_SIZED) != 0){
+		rex |= 0x8;	/* Set REX.W if it isn't already set */
+	    }
+	}
 
 	/* setup the mnemonic with a possible suffix */
 	if(dp->adr_mode != CBW && dp->adr_mode != CWD){
-	    if(dp->suffix){
+	    if((dp->flags & HAS_SUFFIX) != 0){
 		if(data16 == TRUE)
 		    sprintf(mnemonic, "%sw", dp->name);
 		else{
-		    if(dp->adr_mode == Mnol)
+		    if(dp->adr_mode == Mnol || dp->adr_mode == INM)
 			sprintf(mnemonic, "%s", dp->name);
+		    else if(REX_W(rex) != 0)
+			sprintf(mnemonic, "%sq", dp->name);
 		    else
 			sprintf(mnemonic, "%sl", dp->name);
 		}
 	    }
 	    else{
 		sprintf(mnemonic, "%s", dp->name);
+	    }
+	    if(dp->adr_mode == BD){
+		if(strcmp(seg, "%cs:") == 0){
+		    sprintf(mnemonic, "%s,pn", mnemonic);
+		    seg = "";
+		}
+		else if(strcmp(seg, "%ds:") == 0){
+		    sprintf(mnemonic, "%s,pt", mnemonic);
+		    seg = "";
+		}
 	    }
 	}
 
@@ -1424,7 +1840,7 @@ enum bool verbose)
 	switch(dp -> adr_mode){
 
 	case BSWAP:
-	    reg_name = REG32[(opcode5 & 0x7)][1];
+		reg_name = get_reg_name((opcode5 & 0x7), 1, data16, rex);
 	    printf("%s\t%s\n", mnemonic, reg_name);
 	    return(length);
 
@@ -1436,10 +1852,7 @@ enum bool verbose)
 		modrm_byte(&mode, &reg, &r_m, byte);
 	    }
 	    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size, result0);
-	    if(data16 == TRUE)
-		reg_name = REG16[reg][wbit];
-	    else
-		reg_name = REG32[reg][wbit];
+		reg_name = get_reg_name(reg, wbit, data16, rex);
 	    printf("%s\t%s,", mnemonic, reg_name);
 	    print_operand(seg, symadd0, symsub0, value0, value0_size, result0,
 			  "\n");
@@ -1455,10 +1868,7 @@ enum bool verbose)
 		byte = get_value(sizeof(char), sect, &length, &left);
 		modrm_byte(&mode, &reg, &r_m, byte);
 	    }
-	    if(data16 == TRUE)
-		reg_name = REG16[reg][LONGOPERAND];
-	    else
-		reg_name = REG32[reg][LONGOPERAND];
+	    reg_name = get_reg_name(reg, LONGOPERAND, data16, rex);
 	    wbit = WBIT(opcode5);
 	    data16 = 1;
 	    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size, result0);
@@ -1479,14 +1889,11 @@ enum bool verbose)
 	    GET_OPERAND(&symadd1, &symsub1, &value1, &value1_size, result1);
 	    /* opcode 0x6B for byte, sign-extended displacement,
 		0x69 for word(s) */
-	    value0_size = OPSIZE(data16, opcode2 == 0x9);
-	    IMMEDIATE(&symadd0, &symsub0, &value0, value0_size);
-	    if(data16 == TRUE)
-		reg_name = REG16[reg][wbit];
-	    else
-		reg_name = REG32[reg][wbit];
+	    value0_size = OPSIZE(data16, opcode2 == 0x9, 0);
+	    IMMEDIATE(&symadd0, &symsub0, &imm0, value0_size);
+	    reg_name = get_reg_name(reg, wbit, data16, rex);
 	    printf("%s\t$", mnemonic);
-	    print_operand("", symadd0, symsub0, value0, value0_size, "", ",");
+	    print_operand("", symadd0, symsub0, imm0, value0_size, "", ",");
 	    print_operand(seg, symadd1, symsub1, value1, value1_size, result1,
 			  ",");
 	    printf("%s\n", reg_name);
@@ -1494,6 +1901,7 @@ enum bool verbose)
 
 	/* memory or register operand to register, with 'w' bit	*/
 	case MRw:
+	case SSE4MRw:
 	    wbit = WBIT(opcode2);
 	    if(got_modrm_byte == FALSE){
 		got_modrm_byte = TRUE;
@@ -1501,10 +1909,7 @@ enum bool verbose)
 		modrm_byte(&mode, &reg, &r_m, byte);
 	    }
 	    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size, result0);
-	    if(data16 == TRUE)
-		reg_name = REG16[reg][wbit];
-	    else
-		reg_name = REG32[reg][wbit];
+	    reg_name = get_reg_name(reg, wbit, data16, rex);
 	    printf("%s\t", mnemonic);
 	    print_operand(seg, symadd0, symsub0, value0, value0_size, result0,
 			  ",");
@@ -1521,10 +1926,7 @@ enum bool verbose)
 		modrm_byte(&mode, &reg, &r_m, byte);
 	    }
 	    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size, result0);
-	    if(data16 == TRUE)
-		reg_name = REG16[reg][wbit];
-	    else
-		reg_name = REG32[reg][wbit];
+	    reg_name = get_reg_name(reg, wbit, data16, rex);
 	    printf("%s\t%s,", mnemonic, reg_name);
 	    print_operand(seg, symadd0, symsub0, value0, value0_size, result0,
 			  "\n");
@@ -1543,7 +1945,7 @@ enum bool verbose)
 	    case 0x7e: /* movq & movd */
 		if(prefix_byte == 0x66){
 		    /* movd from xmm to r/m32 */
-		    printf("%sd\t%%xmm%lu,", mnemonic, reg);
+		    printf("%sd\t%%xmm%u,", mnemonic, xmm_reg(reg, rex));
 		    wbit = LONGOPERAND;
 		    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size,
 				result0);
@@ -1567,7 +1969,7 @@ enum bool verbose)
 				result0);
 		    print_operand(seg, symadd0, symsub0, value0, value0_size,
 				  result0, ",");
-		    printf("%%xmm%lu\n", reg);
+		    printf("%%xmm%u\n", xmm_reg(reg, rex));
 		}
 		else{ /* no prefix_byte */
 		    /* movd from mm to r/m32 */
@@ -1589,7 +1991,7 @@ enum bool verbose)
 		byte = get_value(sizeof(char), sect, &length, &left);
 		modrm_byte(&mode, &reg, &r_m, byte);
 	    }
-	    sprintf(result0, "%%xmm%lu", reg);
+	    sprintf(result0, "%%xmm%u", xmm_reg(reg, rex));
 	    switch(opcode4 << 4 | opcode5){
 	    case 0x11: /* movupd &         movups */
 		       /*          movsd &        movss */
@@ -1656,6 +2058,54 @@ enum bool verbose)
 			  result1, "\n");
 	    return(length);
 
+	/* MNI instructions */
+	case MNI:
+	    data16 = FALSE;
+	    if(got_modrm_byte == FALSE){
+		got_modrm_byte = TRUE;
+		byte = get_value(sizeof(char), sect, &length, &left);
+		modrm_byte(&mode, &reg, &r_m, byte);
+	    }
+	    if(prefix_byte == 0x66){
+		sse2 = TRUE;
+		sprintf(result1, "%%xmm%u", xmm_reg(reg, rex));
+	    }
+	    else{ /* no prefix byte */
+		mmx = TRUE;
+		sprintf(result1, "%%mm%lu", reg);
+	    }
+	    printf("%s\t", mnemonic);
+	    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size, result0);
+	    print_operand(seg, symadd0, symsub0, value0, value0_size,
+			  result0, ",");
+	    printf("%s\n", result1);
+		return length;
+
+	/* MNI instructions with 8-bit immediate */
+	case MNIi:
+	    data16 = FALSE;
+	    if (got_modrm_byte == FALSE) {
+			got_modrm_byte = TRUE;
+			byte = get_value(sizeof(char), sect, &length, &left);
+			modrm_byte(&mode, &reg, &r_m, byte);
+	    }
+	    if(prefix_byte == 0x66){
+		sse2 = TRUE;
+		sprintf(result1, "%%xmm%u", xmm_reg(reg, rex));
+	    }
+	    else{ /* no prefix byte */
+		mmx = TRUE;
+		sprintf(result1, "%%mm%lu", reg);
+	    }
+	    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size, result0);
+	    byte = get_value(sizeof(char), sect, &length, &left);
+		printf("%s\t$0x%x,", mnemonic, byte);
+		
+	    print_operand(seg, symadd0, symsub0, value0, value0_size,
+			  result0, ",");
+	    printf("%s\n", result1);
+		return length;
+
 	/* SSE2 instructions with further prefix decoding */
 	case SSE2:
 	    data16 = FALSE;
@@ -1664,7 +2114,7 @@ enum bool verbose)
 		byte = get_value(sizeof(char), sect, &length, &left);
 		modrm_byte(&mode, &reg, &r_m, byte);
 	    }
-	    sprintf(result1, "%%xmm%lu", reg);
+	    sprintf(result1, "%%xmm%u", xmm_reg(reg, rex));
 	    switch(opcode4 << 4 | opcode5){
 	    case 0x14: /* unpcklpd &                 unpcklps */
 	    case 0x15: /* unpckhpd &                 unpckhps */
@@ -1724,7 +2174,7 @@ enum bool verbose)
 		break;
 	    case 0x50: /* movmskpd &                 movmskps */
 		sse2 = TRUE;
-		reg_name = REG32[reg][1];
+		reg_name = get_reg_name(reg, 1, data16, rex);
 		strcpy(result1, reg_name);
 		if(prefix_byte == 0x66)
 		    printf("%spd\t", mnemonic);
@@ -1770,13 +2220,13 @@ enum bool verbose)
 		else if(prefix_byte == 0xf2){
 		    sse2 = TRUE;
 		    printf("%stsd2si\t", mnemonic);
-		    reg_name = REG32[reg][1];
+		    reg_name = get_reg_name(reg, 1, data16, rex);
 		    strcpy(result1, reg_name);
 		}
 		else if(prefix_byte == 0xf3){
 		    sse2 = TRUE;
 		    printf("%stss2si\t", mnemonic);
-		    reg_name = REG32[reg][1];
+		    reg_name = get_reg_name(reg, 1, data16, rex);
 		    strcpy(result1, reg_name);
 		}
 		else{ /* no prefix_byte */
@@ -1794,13 +2244,13 @@ enum bool verbose)
 		else if(prefix_byte == 0xf2){
 		    sse2 = TRUE;
 		    printf("%ssd2si\t", mnemonic);
-		    reg_name = REG32[reg][1];
+		    reg_name = get_reg_name(reg, 1, data16, rex);
 		    strcpy(result1, reg_name);
 		}
 		else if(prefix_byte == 0xf3){
 		    sse2 = TRUE;
 		    printf("%sss2si\t", mnemonic);
-		    reg_name = REG32[reg][1];
+		    reg_name = get_reg_name(reg, 1, data16, rex);
 		    strcpy(result1, reg_name);
 		}
 		else{ /* no prefix_byte */
@@ -1976,12 +2426,13 @@ enum bool verbose)
 		break;
 	    case 0xd7: /* pmovmskb */
 		if(prefix_byte == 0x66){
-		    reg_name = REG32[reg][1];
-		    printf("%s\t%%xmm%lu,%s\n", mnemonic, r_m, reg_name);
+		    reg_name = get_reg_name(reg, 1, data16, rex);
+		    printf("%s\t%%xmm%u,%s\n", mnemonic, xmm_rm(r_m, rex),
+			   reg_name);
 		    return(length);
 		}
 		else{ /* no prefix_byte */
-		    reg_name = REG32[reg][1];
+		    reg_name = get_reg_name(reg, 1, data16, rex);
 		    printf("%s\t%%mm%lu,%s\n", mnemonic, r_m, reg_name);
 		    return(length);
 		}
@@ -2021,6 +2472,132 @@ enum bool verbose)
 	    print_operand(seg, symadd0, symsub0, value0, value0_size,
 			  result0, ",");
 	    printf("%s\n", result1);
+	    return(length);
+
+	/* SSE4 instructions */
+	case SSE4:
+	    sse2 = TRUE;
+	    data16 = FALSE;
+	    wbit = LONGOPERAND;
+	    if(got_modrm_byte == FALSE){
+		got_modrm_byte = TRUE;
+		byte = get_value(sizeof(char), sect, &length, &left);
+		modrm_byte(&mode, &reg, &r_m, byte);
+	    }
+	    printf("%s\t", mnemonic);
+	    sprintf(result1, "%%xmm%u", xmm_reg(reg, rex));
+	    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size, result0);
+	    print_operand(seg, symadd0, symsub0, value0, value0_size,
+			  result0, ",");
+	    printf("%s\n", result1);
+	    return(length);
+
+	/* SSE4 instructions with 8 bit immediate */
+	case SSE4i:
+	    sse2 = TRUE;
+	    data16 = FALSE;
+	    wbit = LONGOPERAND;
+	    if(got_modrm_byte == FALSE){
+		got_modrm_byte = TRUE;
+		byte = get_value(sizeof(char), sect, &length, &left);
+		modrm_byte(&mode, &reg, &r_m, byte);
+	    }
+	    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size, result0);
+	    byte = get_value(sizeof(char), sect, &length, &left);
+	    printf("%s\t$0x%x,", mnemonic, byte);
+	    print_operand(seg, symadd0, symsub0, value0, value0_size,
+			  result0, ",");
+	    printf("%%xmm%u\n", xmm_reg(reg, rex));
+	    return(length);
+
+	/* SSE4 instructions with dest to memory and 8-bit immediate */
+	case SSE4itm:
+	    sse2 = FALSE;
+	    data16 = FALSE;
+	    wbit = LONGOPERAND;
+	    if(got_modrm_byte == FALSE){
+		got_modrm_byte = TRUE;
+		byte = get_value(sizeof(char), sect, &length, &left);
+		modrm_byte(&mode, &reg, &r_m, byte);
+	    }
+	    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size, result0);
+	    byte = get_value(sizeof(char), sect, &length, &left);
+	    if(dp == &op0F3A[0x16]){
+		if(rex != 0)
+		    printf("%sq\t$0x%x,", mnemonic, byte);
+		else
+		    printf("%sd\t$0x%x,", mnemonic, byte);
+	    }
+	    else
+		printf("%s\t$0x%x,", mnemonic, byte);
+	    printf("%%xmm%u,", xmm_reg(reg, rex));
+	    print_operand(seg, symadd0, symsub0, value0, value0_size,
+			  result0, "\n");
+	    return(length);
+
+	/* SSE4 instructions with src from memory and 8-bit immediate */
+	case SSE4ifm:
+	    sse2 = FALSE;
+	    data16 = FALSE;
+	    wbit = LONGOPERAND;
+	    if(got_modrm_byte == FALSE){
+		got_modrm_byte = TRUE;
+		byte = get_value(sizeof(char), sect, &length, &left);
+		modrm_byte(&mode, &reg, &r_m, byte);
+	    }
+	    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size, result0);
+	    byte = get_value(sizeof(char), sect, &length, &left);
+	    if(dp == &op0F3A[0x22]){
+		if(rex != 0)
+		    printf("%sq\t$0x%x,", mnemonic, byte);
+		else
+		    printf("%sd\t$0x%x,", mnemonic, byte);
+	    }
+	    else
+		printf("%s\t$0x%x,", mnemonic, byte);
+	    print_operand(seg, symadd0, symsub0, value0, value0_size,
+			  result0, ",");
+	    printf("%%xmm%u\n", xmm_reg(reg, rex));
+	    return(length);
+
+	/* SSE4.2 instructions memory or register operand to register */
+	case SSE4CRCb:
+	    wbit = 0;
+	    if(got_modrm_byte == FALSE){
+		got_modrm_byte = TRUE;
+		byte = get_value(sizeof(char), sect, &length, &left);
+		modrm_byte(&mode, &reg, &r_m, byte);
+	    }
+	    /*
+	     * This hack is to get the byte register name for SSE4CRCb opcodes
+	     * when get_operand() is called but not when reg_name() is called
+	     * after that.
+	     */
+	    rex_save = rex;
+	    if(mode == 0x3)
+		rex = 0;
+	    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size, result0);
+	    rex = rex_save;
+	    reg_name = get_reg_name(reg, 1 /* wbit */, 0 /* data16 */, rex);
+	    printf("%s\t", mnemonic);
+	    print_operand(seg, symadd0, symsub0, value0, value0_size, result0,
+			  ",");
+	    printf("%s\n", reg_name);
+	    return(length);
+
+	case SSE4CRC:
+	    wbit = 1;
+	    if(got_modrm_byte == FALSE){
+		got_modrm_byte = TRUE;
+		byte = get_value(sizeof(char), sect, &length, &left);
+		modrm_byte(&mode, &reg, &r_m, byte);
+	    }
+	    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size, result0);
+	    reg_name = get_reg_name(reg, 1 /* wbit */, 0 /* data16 */, rex);
+	    printf("%s\t", mnemonic);
+	    print_operand(seg, symadd0, symsub0, value0, value0_size, result0,
+			  ",");
+	    printf("%s\n", reg_name);
 	    return(length);
 
 	/* SSE2 instructions with 8 bit immediate with further prefix decoding*/
@@ -2072,13 +2649,13 @@ enum bool verbose)
 		break;
 	    case 0xc5: /* pextrw */
 		if(prefix_byte == 0x66){
-		    reg_name = REG32[reg][1];
-		    printf("%s\t$0x%x,%%xmm%lu,%s\n", mnemonic, byte, r_m,
-			   reg_name);
+		    reg_name = get_reg_name(reg, 1, data16, rex);
+		    printf("%s\t$0x%x,%%xmm%u,%s\n", mnemonic, byte,
+			   xmm_rm(r_m, rex), reg_name);
 		    return(length);
 		}
 		else{ /* no prefix_byte */
-		    reg_name = REG32[reg][1];
+		    reg_name = get_reg_name(reg, 1, data16, rex);
 		    printf("%s\t$0x%x,%%mm%lu,%s\n", mnemonic, byte, r_m,
 			   reg_name);
 		    return(length);
@@ -2097,7 +2674,7 @@ enum bool verbose)
 	    }
 	    print_operand(seg, symadd0, symsub0, value0, value0_size,
 			  result0, ",");
-	    printf("%%xmm%lu\n", reg);
+	    printf("%%xmm%u\n", xmm_reg(reg, rex));
 	    return(length);
 
 	/* SSE2 instructions with 8 bit immediate and only 1 reg */
@@ -2170,7 +2747,7 @@ enum bool verbose)
 		}
 		break;
 	    }
-	    printf("%%xmm%lu\n", r_m);
+	    printf("%%xmm%u\n", xmm_rm(r_m, rex));
 	    return(length);
 
        /* 3DNow instructions */
@@ -2255,13 +2832,10 @@ enum bool verbose)
 	    wbit = LONGOPERAND;
 	    GET_OPERAND(&symadd1, &symsub1, &value1, &value1_size, result1);
 	    value0_size = sizeof(char);
-	    IMMEDIATE(&symadd0, &symsub0, &value0, value0_size);
-	    if(data16 == TRUE)
-		reg_name = REG16[reg][wbit];
-	    else
-		reg_name = REG32[reg][wbit];
+	    IMMEDIATE(&symadd0, &symsub0, &imm0, value0_size);
+	    reg_name = get_reg_name(reg, wbit, data16, rex);
 	    printf("%s\t$", mnemonic);
-	    print_operand("", symadd0, symsub0, value0, value0_size, "", ",");
+	    print_operand("", symadd0, symsub0, imm0, value0_size, "", ",");
 	    printf("%s,", reg_name);
 	    print_operand(seg, symadd1, symsub1, value1, value1_size, result1,
 			  "\n");
@@ -2276,10 +2850,7 @@ enum bool verbose)
 	    }
 	    wbit = LONGOPERAND;
 	    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size, result0);
-	    if(data16 == TRUE)
-		reg_name = REG16[reg][wbit];
-	    else
-		reg_name = REG32[reg][wbit];
+	    reg_name = get_reg_name(reg, wbit, data16, rex);
 	    printf("%s\t%%cl,%s,", mnemonic, reg_name);
 	    print_operand(seg, symadd0, symsub0, value0, value0_size, result0,
 			  "\n");
@@ -2290,10 +2861,10 @@ enum bool verbose)
 	    wbit = WBIT(opcode2);
 	    GET_OPERAND(&symadd1, &symsub1, &value1, &value1_size, result1);
 	    /* A long immediate is expected for opcode 0x81, not 0x80 & 0x83 */
-	    value0_size = OPSIZE(data16, opcode2 == 1);
-	    IMMEDIATE(&symadd0, &symsub0, &value0, value0_size);
+	    value0_size = OPSIZE(data16, opcode2 == 1, 0);
+	    IMMEDIATE(&symadd0, &symsub0, &imm0, value0_size);
 	    printf("%s\t$", mnemonic);
-	    print_operand("", symadd0, symsub0, value0, value0_size, "", ",");
+	    print_operand("", symadd0, symsub0, imm0, value0_size, "", ",");
 	    print_operand(seg, symadd1, symsub1, value1, value1_size, result1,
 			  "\n");
 	    return(length);
@@ -2307,10 +2878,10 @@ enum bool verbose)
 	    }
 	    wbit = WBIT(opcode2);
 	    GET_OPERAND(&symadd1, &symsub1, &value1, &value1_size, result1);
-	    value0_size = OPSIZE(data16, wbit);
-	    IMMEDIATE(&symadd0, &symsub0, &value0, value0_size);
+	    value0_size = OPSIZE(data16, wbit, 0);
+	    IMMEDIATE(&symadd0, &symsub0, &imm0, value0_size);
 	    printf("%s\t$", mnemonic);
-	    print_operand("", symadd0, symsub0, value0, value0_size, "", ",");
+	    print_operand("", symadd0, symsub0, imm0, value0_size, "", ",");
 	    print_operand(seg, symadd1, symsub1, value1, value1_size, result1,
 			  "\n");
 	    return(length);
@@ -2319,36 +2890,56 @@ enum bool verbose)
 	case IR:
 	    wbit = (opcode2 >> 3) & 0x1; /* w-bit here (with regs) is bit 3 */
 	    reg = REGNO(opcode2);
-	    value0_size = OPSIZE(data16, wbit);
-	    IMMEDIATE(&symadd0, &symsub0, &value0, value0_size);
-	    if(data16 == TRUE)
-		reg_name = REG16[reg][wbit];
-	    else
-		reg_name = REG32[reg][wbit];
+	    value0_size = OPSIZE(data16, wbit, 0);
+	    IMMEDIATE(&symadd0, &symsub0, &imm0, value0_size);
+	    reg_name = get_r_m_name(reg, wbit, data16, rex);
 	    printf("%s\t$", mnemonic);
-	    print_operand("", symadd0, symsub0, value0, value0_size, "", ",");
+	    print_operand("", symadd0, symsub0, imm0, value0_size, "", ",");
+	    printf("%s\n", reg_name);
+	    return(length);
+
+	/* immediate to register with register in low 3 bits of op code,
+	   possibly with a 64-bit immediate */
+	case IR64:
+	    wbit = (opcode2 >> 3) & 0x1; /* w-bit here (with regs) is bit 3 */
+	    reg = REGNO(opcode2);
+	    value0_size = OPSIZE(data16, wbit, REX_W(rex));
+	    IMMEDIATE(&symadd0, &symsub0, &imm0, value0_size);
+	    reg_name = get_r_m_name(reg, wbit, data16, rex);
+	    printf("%s\t$", mnemonic);
+	    print_operand("", symadd0, symsub0, imm0, value0_size, "", ",");
 	    printf("%s\n", reg_name);
 	    return(length);
 
 	/* memory operand to accumulator */
 	case OA:
-	    value0_size = OPSIZE(addr16, LONGOPERAND);
-	    IMMEDIATE(&symadd0, &symsub0, &value0, value0_size);
+	    if((cputype & CPU_ARCH_ABI64) == CPU_ARCH_ABI64){
+		value0_size = OPSIZE(addr16, LONGOPERAND, 1);
+		strcpy(mnemonic, "movabsl");
+	    }
+	    else
+		value0_size = OPSIZE(addr16, LONGOPERAND, 0);
+	    IMMEDIATE(&symadd0, &symsub0, &imm0, value0_size);
 	    printf("%s\t", mnemonic);
-	    print_operand(seg, symadd0, symsub0, value0, value0_size, "", ",");
+	    print_operand(seg, symadd0, symsub0, imm0, value0_size, "", ",");
 	    wbit = WBIT(opcode2);
-	    reg_name = (data16 ? REG16 : REG32)[0][wbit];
+	    reg_name = get_reg_name(0, wbit, data16, rex);
 	    printf("%s\n", reg_name);
 	    return(length);
 
 	/* accumulator to memory operand */
 	case AO:
-	    value0_size = OPSIZE(addr16, LONGOPERAND);
-	    IMMEDIATE(&symadd0, &symsub0, &value0, value0_size);
+	    if((cputype & CPU_ARCH_ABI64) == CPU_ARCH_ABI64){
+		value0_size = OPSIZE(addr16, LONGOPERAND, 1);
+		strcpy(mnemonic, "movabsl");
+	    }
+	    else
+		value0_size = OPSIZE(addr16, LONGOPERAND, 0);
+	    IMMEDIATE(&symadd0, &symsub0, &imm0, value0_size);
 	    wbit = WBIT(opcode2);
-	    reg_name = (data16 ? REG16 : REG32)[0][wbit];
+	    reg_name = get_reg_name(0, wbit, data16, rex);
 	    printf("%s\t%s,", mnemonic, reg_name);
-	    print_operand(seg, symadd0, symsub0, value0, value0_size, "", "\n");
+	    print_operand(seg, symadd0, symsub0, imm0, value0_size, "", "\n");
 	    return(length);
 
 	/* memory or register operand to segment register */
@@ -2400,11 +2991,11 @@ enum bool verbose)
 	    wbit = WBIT(opcode2);
 	    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size, result0);
 	    value1_size = sizeof(char);
-	    IMMEDIATE(&symadd1, &symsub1, &value1, value1_size);
+	    IMMEDIATE(&symadd1, &symsub1, &imm0, value1_size);
 	    /* When vbit is set, register is an operand, otherwise just $0x1 */
 	    reg_name = vbit ? "%cl," : "" ;
 	    printf("%s\t$", mnemonic);
-	    print_operand("", symadd1, symsub1, value1, value1_size, "", ",");
+	    print_operand("", symadd1, symsub1, imm0, value1_size, "", ",");
 	    printf("%s", reg_name);
 	    print_operand(seg, symadd0, symsub0, value0, value0_size, result0,
 			  "\n");
@@ -2414,9 +3005,9 @@ enum bool verbose)
 	    wbit = LONGOPERAND;
 	    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size, result0);
 	    value1_size = sizeof(char);
-	    IMMEDIATE(&symadd1, &symsub1, &value1, value1_size);
+	    IMMEDIATE(&symadd1, &symsub1, &imm0, value1_size);
 	    printf("%s\t$", mnemonic);
-	    print_operand("", symadd1, symsub1, value1, value1_size, "", ",");
+	    print_operand("", symadd1, symsub1, imm0, value1_size, "", ",");
 	    print_operand(seg, symadd0, symsub0, value0, value0_size, result0,
 			  "\n");
 	    return(length);
@@ -2434,6 +3025,37 @@ enum bool verbose)
 	case Mnol:
 	/* single memory or register operand */
 	case M:
+	    switch(byte){
+	    case 0xc1:
+		printf("vmcall\n");
+		return(length);
+	    case 0xc2:
+		printf("vmlaunch\n");
+		return(length);
+	    case 0xc3:
+		printf("vmresume\n");
+		return(length);
+	    case 0xc4:
+		printf("vmxoff\n");
+		return(length);
+	    case 0xc7:
+		if(prefix_byte == 0x66)
+		    sprintf(mnemonic, "vmclear");
+		else if(prefix_byte == 0xf3)
+		    sprintf(mnemonic, "vmxon");
+		else{
+		    if(got_modrm_byte == FALSE){
+			got_modrm_byte = TRUE;
+			byte = get_value(sizeof(char), sect, &length, &left);
+			modrm_byte(&mode, &reg, &r_m, byte);
+		    }
+		    if(reg == 6)
+			sprintf(mnemonic, "vmptrld");
+		    else if(reg == 7)
+			sprintf(mnemonic, "vmptrst");
+		}
+		break;
+	    }
 	    if(got_modrm_byte == FALSE){
 		got_modrm_byte = TRUE;
 		byte = get_value(sizeof(char), sect, &length, &left);
@@ -2469,13 +3091,13 @@ enum bool verbose)
 		vbit = 1;
 		/* fall thru */
 	    case 0: 
-		reg_name = CONTROLREG[reg];
+		reg_name = CONTROLREG[reg + (REX_R(rex) << 3)];
 		break;
 	    case 3:
 		vbit = 1;
 		/* fall thru */
 	    case 1:
-		reg_name = DEBUGREG[reg];
+		reg_name = DEBUGREG[reg + (REX_R(rex) << 3)];
 		break;
 	    case 6:
 		vbit = 1;
@@ -2484,20 +3106,21 @@ enum bool verbose)
 		reg_name = TESTREG[reg];
 		break;
 	    }
-	    if(vbit)
-		printf("%s\t%s,%s\n", mnemonic, REG32[r_m][1], reg_name);
-	    else
-		printf("%s\t%s,%s\n", mnemonic, reg_name, REG32[r_m][1]);
+	    if(vbit){
+		printf("%s\t%s,%s\n", mnemonic, get_r_m_name(r_m, 1, data16,
+		       rex), reg_name);
+	    }
+	    else{
+		printf("%s\t%s,%s\n", mnemonic, reg_name, get_r_m_name(r_m, 1,
+		       data16, rex));
+	    }
 	    return(length);
 
 	/* single register operand with register in the low 3	*/
 	/* bits of op code					*/
 	case R:
 	    reg = REGNO(opcode2);
-	    if(data16 == TRUE)
-		reg_name = REG16[reg][LONGOPERAND];
-	    else
-		reg_name = REG32[reg][LONGOPERAND];
+	    reg_name = get_r_m_name(reg, LONGOPERAND, data16, rex);
 	    printf("%s\t%s\n", mnemonic, reg_name);
 	    return(length);
 
@@ -2505,14 +3128,8 @@ enum bool verbose)
 	/* bits of op code, xchg instructions                   */
 	case RA:
 	    reg = REGNO(opcode2);
-	    if(data16 == TRUE){
-		reg_name = REG16[reg][LONGOPERAND];
-		printf("%s\t%s,%%ax\n", mnemonic, reg_name);
-	    }
-	    else{
-		reg_name = REG32[reg][LONGOPERAND];
-		printf("%s\t%s,%%eax\n", mnemonic, reg_name);
-	    }
+	    reg_name = get_reg_name(reg, LONGOPERAND, data16, rex);
+		printf("%s\t%s,%s\n", mnemonic, reg_name, (data16 ? "%ax" : "%eax"));
 	    return(length);
 
 	/* single segment register operand, with reg in bits 3-4 of op code */
@@ -2537,10 +3154,7 @@ enum bool verbose)
 	    }
 	    wbit = LONGOPERAND;
 	    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size, result0);
-	    if(data16 == TRUE)
-		reg_name = REG16[reg][wbit];
-	    else
-		reg_name = REG32[reg][wbit];
+	    reg_name = get_reg_name(reg, wbit, data16, rex);
 	    printf("%s\t", mnemonic);
 	    print_operand(seg, symadd0, symsub0, value0, value0_size, result0,
 			  ",");
@@ -2549,15 +3163,15 @@ enum bool verbose)
 
 	/* immediate operand to accumulator */
 	case IA:
-	    value0_size = OPSIZE(data16, WBIT(opcode2));
+	    value0_size = OPSIZE(data16, WBIT(opcode2), 0);
 	    switch(value0_size) {
 		case 1: reg_name = "%al"; break;
 		case 2: reg_name = "%ax"; break;
 		case 4: reg_name = "%eax"; break;
 	    }
-	    IMMEDIATE(&symadd0, &symsub0, &value0, value0_size);
+	    IMMEDIATE(&symadd0, &symsub0, &imm0, value0_size);
 	    printf("%s\t$", mnemonic);
-	    print_operand("", symadd0, symsub0, value0, value0_size, "", ",");
+	    print_operand("", symadd0, symsub0, imm0, value0_size, "", ",");
 	    printf("%s\n", reg_name);
 	    return(length);
 
@@ -2581,7 +3195,7 @@ enum bool verbose)
 	/* accumulator to di register */
 	case AD:
 	    wbit = WBIT(opcode2);
-	    reg_name = (data16 ? REG16 : REG32)[0][wbit];
+	    reg_name = get_reg_name(0, wbit, data16, rex);
 	    if(addr16 == TRUE)
 		printf("%s\t%s,%s(%%di)\n", mnemonic, reg_name, seg);
 	    else
@@ -2591,7 +3205,7 @@ enum bool verbose)
 	/* si register to accumulator */
 	case SA:
 	    wbit = WBIT(opcode2);
-	    reg_name = (data16 ? REG16 : REG32)[0][wbit];
+	    reg_name = get_reg_name(0, wbit, data16, rex);
 	    if(addr16 == TRUE)
 		printf("%s\t%s(%%si),%s\n", mnemonic, seg, reg_name);
 	    else
@@ -2600,14 +3214,15 @@ enum bool verbose)
 
 	/* single operand, a 16/32 bit displacement */
 	case D:
-	    value0_size = OPSIZE(data16, LONGOPERAND);
+	    value0_size = OPSIZE(data16, LONGOPERAND, 0);
 	    DISPLACEMENT(&symadd0, &symsub0, &value0, value0_size);
 	    printf("%s\t", mnemonic);
 	    print_operand(seg, symadd0, symsub0, value0, value0_size, "", "");
 	    if(verbose){
 		indirect_symbol_name = guess_indirect_symbol(value0,
-		    mh, load_commands, object_byte_sex, indirect_symbols,
-		    nindirect_symbols, symbols, nsymbols, strings,strings_size);
+		    ncmds, sizeofcmds, load_commands, object_byte_sex,
+		    indirect_symbols, nindirect_symbols, symbols, symbols64,
+		    nsymbols, strings,strings_size);
 		if(indirect_symbol_name != NULL)
 		    printf("\t; symbol stub for: %s", indirect_symbol_name);
 	    }
@@ -2618,7 +3233,8 @@ enum bool verbose)
 	case INM:
 	    wbit = LONGOPERAND;
 	    GET_OPERAND(&symadd0, &symsub0, &value0, &value0_size, result0);
-	    if((mode == 0 && (r_m == 5 || r_m == 4)) || mode == 1 || mode == 2)
+	    if((mode == 0 && (r_m == 5 || r_m == 4)) || mode == 1 ||
+		mode == 2 || mode == 3)
 		printf("%s\t*", mnemonic);
 	    else
 		printf("%s\t", mnemonic);
@@ -2641,13 +3257,13 @@ enum bool verbose)
 	 * code in reverse order
 	 */
 	case SO:
-	    value1_size = OPSIZE(data16, LONGOPERAND);
-	    IMMEDIATE(&symadd1, &symsub1, &value1, value1_size);
+	    value1_size = OPSIZE(data16, LONGOPERAND, 0);
+	    IMMEDIATE(&symadd1, &symsub1, &imm1, value1_size);
 	    value0_size = sizeof(short);
-	    IMMEDIATE(&symadd0, &symsub0, &value0, value0_size);
+	    IMMEDIATE(&symadd0, &symsub0, &imm0, value0_size);
 	    printf("%s\t$", mnemonic);
-	    print_operand("", symadd0, symsub0, value0, value0_size, "", ",$");
-	    print_operand(seg, symadd1, symsub1, value1, value1_size, "", "\n");
+	    print_operand("", symadd0, symsub0, imm0, value0_size, "", ",$");
+	    print_operand(seg, symadd1, symsub1, imm1, value1_size, "", "\n");
 	    return(length);
 
 	/* jmp/call. single operand, 8 bit displacement */
@@ -2661,61 +3277,61 @@ enum bool verbose)
 
 	/* single 32/16 bit immediate operand */
 	case I:
-	    value0_size = OPSIZE(data16, LONGOPERAND);
-	    IMMEDIATE(&symadd0, &symsub0, &value0, value0_size);
+	    value0_size = OPSIZE(data16, LONGOPERAND, 0);
+	    IMMEDIATE(&symadd0, &symsub0, &imm0, value0_size);
 	    printf("%s\t$", mnemonic);
-	    print_operand("", symadd0, symsub0, value0, value0_size, "", "\n");
+	    print_operand("", symadd0, symsub0, imm0, value0_size, "", "\n");
 	    return(length);
 
 	/* single 8 bit immediate operand */
 	case Ib:
 	    value0_size = sizeof(char);
-	    IMMEDIATE(&symadd0, &symsub0, &value0, value0_size);
+	    IMMEDIATE(&symadd0, &symsub0, &imm0, value0_size);
 	    printf("%s\t$", mnemonic);
-	    print_operand("", symadd0, symsub0, value0, value0_size, "", "\n");
+	    print_operand("", symadd0, symsub0, imm0, value0_size, "", "\n");
 	    return(length);
 
 	case ENTER:
 	    value0_size = sizeof(short);
-	    IMMEDIATE(&symadd0, &symsub0, &value0, value0_size);
+	    IMMEDIATE(&symadd0, &symsub0, &imm0, value0_size);
 	    value1_size = sizeof(char);
-	    IMMEDIATE(&symadd1, &symsub1, &value1, value1_size);
+	    IMMEDIATE(&symadd1, &symsub1, &imm1, value1_size);
 	    printf("%s\t$", mnemonic);
-	    print_operand("", symadd0, symsub0, value0, value0_size, "", ",$");
-	    print_operand("", symadd1, symsub1, value1, value1_size, "", "\n");
+	    print_operand("", symadd0, symsub0, imm0, value0_size, "", ",$");
+	    print_operand("", symadd1, symsub1, imm1, value1_size, "", "\n");
 	    return(length);
 
 	/* 16-bit immediate operand */
 	case RET:
 	    value0_size = sizeof(short);
-	    IMMEDIATE(&symadd0, &symsub0, &value0, value0_size);
+	    IMMEDIATE(&symadd0, &symsub0, &imm0, value0_size);
 	    printf("%s\t$", mnemonic);
-	    print_operand("", symadd0, symsub0, value0, value0_size, "", "\n");
+	    print_operand("", symadd0, symsub0, imm0, value0_size, "", "\n");
 	    return(length);
 
 	/* single 8 bit port operand */
 	case P:
 	    value0_size = sizeof(char);
-	    IMMEDIATE(&symadd0, &symsub0, &value0, value0_size);
+	    IMMEDIATE(&symadd0, &symsub0, &imm0, value0_size);
 	    printf("%s\t$", mnemonic);
-	    print_operand(seg, symadd0, symsub0, value0, value0_size, "", "\n");
+	    print_operand(seg, symadd0, symsub0, imm0, value0_size, "", "\n");
 	    return(length);
 
 	/* single 8 bit (input) port operand				*/
 	case Pi:
 	    value0_size = sizeof(char);
-	    IMMEDIATE(&symadd0, &symsub0, &value0, value0_size);
+	    IMMEDIATE(&symadd0, &symsub0, &imm0, value0_size);
 	    printf("%s\t$", mnemonic);
-	    print_operand(seg, symadd0, symsub0, value0, value0_size, "",
+	    print_operand(seg, symadd0, symsub0, imm0, value0_size, "",
 			  ",%eax\n");
 	    return(length);
 
 	/* single 8 bit (output) port operand				*/
 	case Po:
 	    value0_size = sizeof(char);
-	    IMMEDIATE(&symadd0, &symsub0, &value0, value0_size);
+	    IMMEDIATE(&symadd0, &symsub0, &imm0, value0_size);
 	    printf("%s\t%%eax,$", mnemonic);
-	    print_operand(seg, symadd0, symsub0, value0, value0_size, "", "\n");
+	    print_operand(seg, symadd0, symsub0, imm0, value0_size, "", "\n");
 	    return(length);
 
 	/* single operand, dx register (variable port instruction) */
@@ -2788,7 +3404,10 @@ enum bool verbose)
 	case PREFIX:
 	case UNKNOWN:
 	default:
-	    printf(".byte 0x%02x #bad opcode\n", (unsigned int)byte);
+	    printf(".byte 0x%02x", 0xff & sect[0]);
+	    for(i = 1; i < length; i++)
+		printf(", 0x%02x", 0xff & sect[i]);
+	    printf(" #bad opcode\n");
 	    return(length);
 	} /* end switch */
 }
@@ -2806,6 +3425,7 @@ unsigned long *value,
 unsigned long *value_size,
 char *result,
 
+const cpu_type_t cputype,
 const unsigned long mode,
 const unsigned long r_m,
 const unsigned long wbit,
@@ -2813,6 +3433,7 @@ const enum bool data16,
 const enum bool addr16,
 const enum bool sse2,
 const enum bool mmx,
+const unsigned int rex,
 
 const char *sect,
 unsigned long sect_addr,
@@ -2822,7 +3443,8 @@ unsigned long *left,
 const unsigned long addr,
 const struct relocation_info *sorted_relocs,
 const unsigned long nsorted_relocs,
-const nlist_t *symbols,
+const struct nlist *symbols,
+const struct nlist_64 *symbols64,
 const unsigned long nsymbols,
 const char *strings,
 const unsigned long strings_size,
@@ -2837,7 +3459,7 @@ const enum bool verbose)
     unsigned long index; 	/* index register number from scale-index-byte*/
     unsigned long base;  	/* base register number from scale-index-byte */
     unsigned long sect_offset;
-    unsigned long offset;
+    unsigned long long offset;
 
 	*symadd = NULL;
 	*symsub = NULL;
@@ -2845,7 +3467,8 @@ const enum bool verbose)
 	*result = '\0';
 
 	/* check for the presence of the s-i-b byte */
-	if(r_m == ESP && mode != REG_ONLY && addr16 == FALSE){
+	if(r_m == ESP && mode != REG_ONLY &&
+	   (((cputype & CPU_ARCH_ABI64) == CPU_ARCH_ABI64) || addr16 == FALSE)){
 	    s_i_b = TRUE;
 	    byte = get_value(sizeof(char), sect, length, left);
 	    modrm_byte(&ss, &index, &base, byte);
@@ -2876,30 +3499,97 @@ const enum bool verbose)
 	}
 
 	if(s_i_b == TRUE){
-	    sprintf(result, "(%s%s,%s)", regname32[mode][base],
-		    indexname[index], scale_factor[ss]);
+	    if(((cputype & CPU_ARCH_ABI64) == CPU_ARCH_ABI64) && !addr16){
+		/* If the scale factor is 1, don't display it. */
+		if(ss == 0){
+		    /*
+		     * If mode is 0 and base is 5 (regardless of the rex bit)
+		     * there is no base register, and if the index is
+		     * also 4 then the operand is just a displacement.
+		     */
+		    if(mode == 0 && base == 5 && index == 4){
+			result = "";
+		    }
+		    else{
+			sprintf(result, "(%s%s)", regname64[mode][base +
+				(REX_B(rex) << 3)], indexname64[index +
+				(REX_X(rex) << 3)]);
+		    }
+		}
+		else{
+		    sprintf(result, "(%s%s,%s)", regname64[mode][base +
+			    (REX_B(rex) << 3)], indexname64[index +
+			    (REX_X(rex) << 3)], scale_factor[ss]);
+		}
+	    }
+	    else{
+		/* If the scale factor is 1, don't display it. */
+		if(ss == 0){
+		    /*
+		     * If mode is 0 and base is 5 it there is no base register,
+		     * and if the index is also 4 then the operand is just a
+		     * displacement.
+		     */
+		    if(mode == 0 && base == 5 && index == 4){
+			result = "";
+		    }
+		    else{
+			sprintf(result, "(%s%s)", regname32[mode][base],
+				indexname[index]);
+		    }
+		}
+		else{
+		    sprintf(result, "(%s%s,%s)", regname32[mode][base],
+			    indexname[index], scale_factor[ss]);
+		}
+	    }
 	}
 	else{ /* no s-i-b */
 	    if(mode == REG_ONLY){
 		if(sse2 == TRUE)
-		    sprintf(result, "%%xmm%lu", r_m);
+		    sprintf(result, "%%xmm%u", xmm_rm(r_m, rex));
 		else if(mmx == TRUE)
 		    sprintf(result, "%%mm%lu", r_m);
-		else if(data16 == TRUE)
-		    strcpy(result, REG16[r_m][wbit]);
+		else if (data16 == FALSE || rex != 0)
+		    /* The presence of a REX byte overrides 66h. */
+		    strcpy(result, REG32[r_m + (REX_B(rex) << 3)][wbit +
+			   REX_W(rex)]);
 		else
-		    strcpy(result, REG32[r_m][wbit]);
+		    strcpy(result, REG16[r_m][wbit]);
 	    }
 	    else{ /* Modes 00, 01, or 10 */
 		if(r_m == EBP && mode == 0){ /* displacement only */
-		    *result = '\0';
+		    if((cputype & CPU_ARCH_ABI64) == CPU_ARCH_ABI64)
+			/*
+			 * In 64-bit mode, mod=00 and r/m=101 defines
+			 * RIP-relative addressing with a 32-bit displacement.
+			 * In 32-bit mode, it's just a 32-bit displacement. See
+			 * section 2.2.1.6 ("RIP-Relative Addressing") of Volume
+			 * 2A of the Intel IA-32 manual.
+			 */
+			sprintf(result, "(%%rip)");
+		    else
+			*result = '\0';
 		}
 		else {
 		    /* Modes 00, 01, or 10, not displacement only, no s-i-b */
-		    if(addr16 == TRUE)
-			sprintf(result, "(%s)", regname16[mode][r_m]);
-		    else
-			sprintf(result, "(%s)", regname32[mode][r_m]);
+		    if(addr16 == TRUE) {
+			if((cputype & CPU_ARCH_ABI64) == CPU_ARCH_ABI64)
+			    /*
+			     *  In 64-bit mode, the address size prefix drops us
+			     * down to 32-bit, not 16-bit.
+			     */
+			    sprintf(result, "(%s)", regname32[mode][r_m]);
+			else
+			    sprintf(result, "(%s)", regname16[mode][r_m]);
+		    }
+		    else{
+			if((cputype & CPU_ARCH_ABI64) == CPU_ARCH_ABI64)
+			    sprintf(result, "(%s)", regname64[mode][r_m +
+				    (REX_B(rex) << 3)]);
+			else
+			    sprintf(result, "(%s)", regname32[mode][r_m]);
+		    }
 		}
 	    }
 	}
@@ -2913,7 +3603,7 @@ void
 immediate(
 const char **symadd,
 const char **symsub,
-unsigned long *value,
+unsigned long long *value,
 unsigned long value_size,
 
 const char *sect,
@@ -2921,10 +3611,12 @@ unsigned long sect_addr,
 unsigned long *length,
 unsigned long *left,
 
+const cpu_type_t cputype,
 const unsigned long addr,
 const struct relocation_info *sorted_relocs,
 const unsigned long nsorted_relocs,
-const nlist_t *symbols,
+const struct nlist *symbols,
+const struct nlist_64 *symbols64,
 const unsigned long nsymbols,
 const char *strings,
 const unsigned long strings_size,
@@ -2933,7 +3625,8 @@ const struct symbol *sorted_symbols,
 const unsigned long nsorted_symbols,
 const enum bool verbose)
 {
-    unsigned long sect_offset, offset;
+    unsigned long sect_offset;
+	unsigned long long offset;
 
 	sect_offset = addr + *length - sect_addr;
 	*value = get_value(value_size, sect, length, left);
@@ -2961,14 +3654,16 @@ unsigned long *value,
 const unsigned long value_size,
 
 const char *sect,
-unsigned long sect_addr,
+uint64_t sect_addr,
 unsigned long *length,
 unsigned long *left,
 
-const unsigned long addr,
+const cpu_type_t cputype,
+const uint64_t addr,
 const struct relocation_info *sorted_relocs,
 const unsigned long nsorted_relocs,
-const nlist_t *symbols,
+const struct nlist *symbols,
+const struct nlist_64 *symbols64,
 const unsigned long nsymbols,
 const char *strings,
 const unsigned long strings_size,
@@ -2977,7 +3672,9 @@ const struct symbol *sorted_symbols,
 const unsigned long nsorted_symbols,
 const enum bool verbose)
 {
-    unsigned long sect_offset, offset;
+    unsigned long sect_offset;
+	unsigned long long offset;
+	uint64_t guess_addr;
 
 	sect_offset = addr + *length - sect_addr;
 	*value = get_value(value_size, sect, length, left);
@@ -2991,12 +3688,27 @@ const enum bool verbose)
 		*value = *value | 0xffff0000;
 	    break;
 	}
-	*value += addr + *length;
+	if((cputype & CPU_ARCH_ABI64) != CPU_ARCH_ABI64)
+	    *value += addr + *length;
+
 	GET_SYMBOL(symadd, symsub, &offset, sect_offset, *value);
 	if(*symadd == NULL){
-	    *symadd = GUESS_SYMBOL(*value);
-	    if(*symadd != NULL)
-		*value = 0;
+	    if((cputype & CPU_ARCH_ABI64) != CPU_ARCH_ABI64){
+		*symadd = GUESS_SYMBOL(*value);
+		if(*symadd != NULL)
+		    *value = 0;
+	    }
+	    else{
+		guess_addr = *value;
+		if((*value) & 0x80000000)
+		    guess_addr |= 0xffffffff00000000ULL;
+		guess_addr += addr + *length;
+		*symadd = GUESS_SYMBOL(guess_addr);
+		if(*symadd != NULL)
+		    *value = 0;
+		else
+		    *value += addr + *length;
+	    }
 	}
 	else if(*symsub != NULL){
 	    *value = offset;
@@ -3012,13 +3724,15 @@ void
 get_symbol(
 const char **symadd,
 const char **symsub,
-unsigned long *offset,
+unsigned long long *offset,
 
+const cpu_type_t cputype,
 const unsigned long sect_offset,
-const unsigned long value,
+const unsigned long long value,
 const struct relocation_info *relocs,
 const unsigned long nrelocs,
-const nlist_t *symbols,
+const struct nlist *symbols,
+const struct nlist_64 *symbols64,
 const unsigned long nsymbols,
 const char *strings,
 const unsigned long strings_size,
@@ -3027,9 +3741,9 @@ const unsigned long nsorted_symbols,
 const enum bool verbose)
 {
     unsigned long i;
-    struct scattered_relocation_info *sreloc, *pair;
     unsigned int r_symbolnum;
     unsigned long n_strx;
+    struct scattered_relocation_info *sreloc, *pair;
     const char *name, *add, *sub;
 
     static char add_buffer[11]; /* max is "0x1234678\0" */
@@ -3043,7 +3757,8 @@ const enum bool verbose)
 	    return;
 
 	for(i = 0; i < nrelocs; i++){
-	    if(((relocs[i].r_address) & R_SCATTERED) != 0){
+	    if((cputype & CPU_ARCH_ABI64) != CPU_ARCH_ABI64 &&
+	       ((relocs[i].r_address) & R_SCATTERED) != 0){
 		sreloc = (struct scattered_relocation_info *)(relocs + i);
 		if(sreloc->r_type == GENERIC_RELOC_PAIR){
 		    fprintf(stderr, "Stray GENERIC_RELOC_PAIR relocation entry "
@@ -3113,7 +3828,10 @@ const enum bool verbose)
 		    if(relocs[i].r_extern){
 		        if(r_symbolnum >= nsymbols)
 			    return;
-			n_strx = symbols[r_symbolnum].n_un.n_strx;
+			if(symbols != NULL)
+			    n_strx = symbols[r_symbolnum].n_un.n_strx;
+			else
+			    n_strx = symbols64[r_symbolnum].n_un.n_strx;
 			if(n_strx <= 0 || n_strx >= strings_size)
 			    return;
 			*symadd = strings + n_strx;
@@ -3135,31 +3853,16 @@ print_operand(
 const char *seg,
 const char *symadd,
 const char *symsub,
-unsigned int value,
+unsigned long long value,
 unsigned int value_size,
 const char *result,
 const char *tail)
 {
-	/*
-	 * To allow the assembler to assemble the same thing as being
-	 * disassembled we need to deal with the fact that the assembler treats
-	 * all expressions as signed 32-bits.  So if the value_size is smaller
-	 * than 32-bits and signed we sign extend it and force the size to be
-	 * 32-bits.
-	 */
-	if(value_size == 1 && (value & 0x80) == 0x80){
-	    value = 0xffffff00 | (value & 0xff);
-	    value_size = 4;
-	}
-	else if(value_size == 2 && (value & 0x8000) == 0x8000){
-	    value = 0xffff0000 | (value & 0xffff);
-	    value_size = 4;
-	}
 	if(symadd != NULL){
 	    if(symsub != NULL){
 		if(value_size != 0){
 		    if(value != 0)
-			printf("%s%s-%s+0x%0*x%s%s", seg, symadd, symsub,
+			printf("%s%s-%s+0x%0*llx%s%s", seg, symadd, symsub,
 			       (int)value_size * 2, value, result, tail);
 		    else
 			printf("%s%s-%s%s%s",seg, symadd, symsub, result, tail);
@@ -3171,7 +3874,7 @@ const char *tail)
 	    else{
 		if(value_size != 0){
 		    if(value != 0)
-			printf("%s%s+0x%0*x%s%s", seg, symadd,
+			printf("%s%s+0x%0*llx%s%s", seg, symadd,
 			       (int)value_size * 2, value, result, tail);
 		    else
 			printf("%s%s%s%s", seg, symadd, result, tail);
@@ -3183,7 +3886,7 @@ const char *tail)
 	}
 	else{
 	    if(value_size != 0){
-		printf("%s0x%0*x%s%s", seg, (int)value_size *2, value, result,
+		printf("%s0x%0*llx%s%s", seg, (int)value_size *2, value, result,
 		       tail);
 	    }
 	    else{
@@ -3194,19 +3897,20 @@ const char *tail)
 
 /*
  * get_value() gets a value of size from sect + length and decrease left by the
- * size and increase length by size.  The size of the value can be 1, 2 or 4
+ * size and increase length by size.  The size of the value can be 1, 2, 4, or 8
  * bytes and the value is in little endian byte order.  The value is always
  * returned as a unsigned long and is not sign extended.
  */
 static
-unsigned long
+unsigned long long
 get_value(
 const unsigned long size,/* size of the value to get as a number of bytes (in)*/
 const char *sect,	/* pointer to the raw data of the section (in) */
 unsigned long *length,	/* number of bytes taken from the sect (in/out) */
 unsigned long *left)	/* number of bytes left in sect after length (in/out) */
 {
-    unsigned long i, value;
+    unsigned long i;
+	unsigned long long value;
     unsigned char byte;
 
 	if(left == 0)
@@ -3220,13 +3924,13 @@ unsigned long *left)	/* number of bytes left in sect after length (in/out) */
 		(*length)++;
 		(*left)--;
 	    }
-	    value |= (unsigned long)byte << (8*i);
+	    value |= (unsigned long long)byte << (8*i);
 	}
 	return(value);
 }
 
 /*
- * modrm_byte() breaks a byte out in to it's mode, reg and r/m bits.
+ * modrm_byte() breaks a byte out into its mode, reg and r/m bits.
  */
 static
 void

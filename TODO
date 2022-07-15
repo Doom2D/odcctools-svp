@@ -2,3 +2,5 @@ ld64:
 * implement mach_absolute_time()
 * implement Linker::processDTrace()
 * build utility rebase
+otool:
+* implement objc support

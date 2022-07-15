@@ -20,7 +20,7 @@
  * 
  * @APPLE_LICENSE_HEADER_END@
  */
-#include <stuff/bool.h>
+#import <stuff/bool.h>
 
 /* Name of this program for error messages (argv[0]) */
 extern char *progname;
@@ -47,6 +47,7 @@ extern enum bool iflag; /* print the shared library initialization table */
 extern enum bool Wflag; /* print the mod time of an archive as an decimal number */
 extern enum bool Xflag; /* don't print leading address in disassembly */
 extern enum bool Zflag; /* don't use simplified ppc mnemonics in disassembly */
+extern enum bool Bflag; /* force Thumb disassembly (ARM objects only) */
 extern char *pflag; 	/* procedure name to start disassembling from */
 extern char *segname,
      *sectname;	    /* name of the section to print the contents of */

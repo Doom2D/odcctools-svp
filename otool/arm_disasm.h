@@ -20,18 +20,30 @@
  * 
  * @APPLE_LICENSE_HEADER_END@
  */
-#if defined(__MWERKS__) && !defined(__private_extern__)
-#define __private_extern__ __declspec(private_extern)
-#endif
+#import <stuff/bytesex.h>
+#import <mach-o/reloc.h>
+#import <mach-o/nlist.h>
+#import <stuff/bool.h>
+#include "stuff/symbol.h"
 
-#import <mach/machine.h>
-#import "stuff/bool.h"
-
-extern unsigned long reloc_pair_r_type(
-    cpu_type_t cputype);
-extern enum bool reloc_has_pair(
-    cpu_type_t cputype,
-    unsigned long r_type);
-extern enum bool reloc_is_sectdiff(
-    cpu_type_t cputype,
-    unsigned long r_type);
+extern unsigned long arm_disassemble(
+    char *sect,
+    unsigned long left,
+    unsigned long addr,
+    unsigned long sect_addr,
+    enum byte_sex object_byte_sex,
+    struct relocation_info *sorted_relocs,
+    unsigned long nsorted_relocs,
+    struct nlist *symbols,
+    unsigned long nsymbols,
+    struct symbol *sorted_symbols,
+    unsigned long nsorted_symbols,
+    char *strings,
+    unsigned long strings_size,
+    uint32_t *indirect_symbols,
+    unsigned long nindirect_symbols,
+    struct load_command *load_commands,
+    uint32_t ncmds,
+    uint32_t sizeofcmds,
+    cpu_subtype_t cpu_subtype,
+    enum bool verbose);

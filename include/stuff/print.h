@@ -24,7 +24,7 @@
 #define __private_extern__ __declspec(private_extern)
 #endif
 
-#include <stdarg.h>
+#import <stdarg.h>
 
 extern void print(
     const char *format, ...)

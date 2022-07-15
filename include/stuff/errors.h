@@ -29,7 +29,7 @@
 #define __private_extern__ __declspec(private_extern)
 #endif
 
-#include "mach/mach.h"
+#import "mach/mach.h"
 
 /* user defined (imported) */
 extern char *progname;
