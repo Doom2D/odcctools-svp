@@ -331,6 +331,9 @@ char **envp)
 	toc_mode = S_IFREG | (0666 & ~oumask);
 	(void)umask(oumask);
 
+#ifdef RANLIB
+	cmd_flags.ranlib = TRUE;
+#else
 	/* see if this is being run as ranlib */
 	p = strrchr(argv[0], '/');
 	if(p != NULL)
@@ -339,6 +342,7 @@ char **envp)
 	    p = argv[0];
 	if(strncmp(p, "ranlib", sizeof("ranlib") - 1) == 0)
 	    cmd_flags.ranlib = TRUE;
+#endif
 
 	/* The default is to used long names */
 	cmd_flags.use_long_names = TRUE;
@@ -2923,7 +2927,7 @@ char *output)
 	 */
 	for(i = 0; i < narchs || (i == 0 && narchs == 0); i++){
 	    reset_execute_list();
-	    add_execute_list("ld");
+	    add_execute_list(makestr(BINDIR, "/", LDPROG, NULL));
 	    if(narchs != 0 && cmd_flags.arch_only_flag.name == NULL)
 		add_execute_list("-arch_multiple");
 	    if(archs != NULL){
