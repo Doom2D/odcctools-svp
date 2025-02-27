@@ -1,0 +1,9 @@
+Note: This fork is not fully updated to newer code and may have bugs. But this is enough to me to make Mac OS X PowerPC builds of http://repo.or.cz/d2df-sdl.git and its C/C++ dependencies using Apple GCC 4.2.1 as cross-compiler.
+
+Known problems:
+- 32-bit only
+- ld64 works very slow (links Doom2DF few minutes on linux machine with Intel Core i7-5820K, while iBook G4 does the same in few seconds)
+
+Contacts:
+- https://doom2d.org/forum/memberlist.php?mode=viewprofile&u=180
+- https://forums.macrumors.com/members/sovietpony.1345233
